@@ -145,7 +145,7 @@ export function isScannerPath(pathname, { allowPaths = null } = {}) {
         let idx = normalized.indexOf(seg, searchFrom);
         while (idx !== -1) {
             const after = normalized[idx + seg.length];
-            if (after === undefined || after === '/' || after === '.') {
+            if (after === undefined || after === '/' || after === '.' || after === '-' || after === '_') {
                 return true;
             }
             searchFrom = idx + 1;
