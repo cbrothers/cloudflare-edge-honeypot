@@ -54,6 +54,38 @@ export const DOTFILE_SEGMENT_REGEX =
 export const SCANNER_EXTENSIONS_REGEX =
     /\.(?:php\d?|phtml|asp|aspx|jsp|jspx|cgi|env|sql|bak|old|orig|swp|ini|conf|yml|yaml|properties)(?:$|\/)/i;
 
+export const VERIFIED_CRAWLER_UA_REGEX =
+    /\b(?:googlebot|google-inspectiontool|googleother|storebot-google|adsbot-google|mediapartners-google|apis-google|bingbot|adidxbot|applebot|duckduckbot|slurp|baiduspider|yandexbot|facebookexternalhit|facebot|linkedinbot|twitterbot|slackbot|discordbot)\b/i;
+
+export const GOOGLEBOT_IP_PREFIXES = [
+    '66.249.',
+    '64.233.172.',
+    '64.233.173.',
+    '2001:4860:4801:'
+];
+
+/**
+ * Detects verified search engine and social preview crawlers so they are never
+ * written to the 24-hour cross-domain IP ban table and receive 404 + noindex on
+ * missing/scanner URLs instead of 403 blocks.
+ */
+export function isVerifiedCrawler(request, clientIp = '') {
+    if (request && request.cf && request.cf.botManagement && request.cf.botManagement.verifiedBot === true) {
+        return true;
+    }
+    const ip = (clientIp || getClientIp(request) || '').trim().toLowerCase();
+    if (ip && GOOGLEBOT_IP_PREFIXES.some((prefix) => ip.startsWith(prefix))) {
+        return true;
+    }
+    if (request && request.headers && typeof request.headers.get === 'function') {
+        const ua = request.headers.get('User-Agent') || request.headers.get('user-agent') || '';
+        if (ua && VERIFIED_CRAWLER_UA_REGEX.test(ua)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * Constant-time string comparison that does not short-circuit on length mismatch.
  */
@@ -93,7 +125,7 @@ export function deriveOverrideToken(secret, prefix = 'eg_ovr') {
 /**
  * Inspects a URL pathname for CMS, dotfile, cloud credential, or exploit scanner probes.
  */
-export function isScannerPath(pathname, { allowPaths = null } = {}) {
+export function isScannerPath(pathname, { allowPaths = null, safePaths = null } = {}) {
     if (!pathname || typeof pathname !== 'string') return false;
 
     let decoded = pathname;
@@ -118,16 +150,24 @@ export function isScannerPath(pathname, { allowPaths = null } = {}) {
         normalized === '/favicon.svg' ||
         normalized === '/favicon.png' ||
         normalized === '/apple-touch-icon.png' ||
-        normalized === '/favicon.ico'
+        normalized === '/favicon.ico' ||
+        normalized.startsWith('/cdn-cgi/')
     ) {
         return false;
     }
 
-    if (allowPaths) {
-        if (typeof allowPaths.has === 'function' && (allowPaths.has(normalized) || allowPaths.has(trimmed))) {
+    const effectiveAllowPaths = allowPaths || safePaths;
+    if (effectiveAllowPaths) {
+        if (
+            typeof effectiveAllowPaths.has === 'function' &&
+            (effectiveAllowPaths.has(normalized) || effectiveAllowPaths.has(trimmed))
+        ) {
             return false;
         }
-        if (Array.isArray(allowPaths) && (allowPaths.includes(normalized) || allowPaths.includes(trimmed))) {
+        if (
+            Array.isArray(effectiveAllowPaths) &&
+            (effectiveAllowPaths.includes(normalized) || effectiveAllowPaths.includes(trimmed))
+        ) {
             return false;
         }
     }
@@ -353,6 +393,21 @@ export function createForbiddenResponse(reason = 'Access Denied', extraHeaders =
     });
 }
 
+export function createNotFoundScannerResponse(reason = 'Not Found', extraHeaders = {}) {
+    return new Response(`Not Found (${reason})`, {
+        status: 404,
+        statusText: 'Not Found',
+        headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'CDN-Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+            'X-Robots-Tag': 'noindex, nofollow',
+            ...extraHeaders
+        }
+    });
+}
+
 export function isNonProductionHost(hostname, productionHostnames = []) {
     if (typeof hostname !== 'string' || !hostname.trim()) return false;
     const normalized = hostname.trim().toLowerCase();
@@ -432,6 +487,21 @@ export async function evaluateHoneypotRequest({
         return { blockedResponse: null, setCookieHeader: null };
     }
 
+    // Verified search engine and social preview crawlers are never banned in memory or KV.
+    // If a crawler IP was previously banned, auto-heal it and return 404 + noindex on scanner paths.
+    if (isVerifiedCrawler(request, clientIp)) {
+        if (clientIp) {
+            await unbanIp(clientIp, env);
+        }
+        if (isScannerPath(url.pathname, { allowPaths })) {
+            return {
+                blockedResponse: createNotFoundScannerResponse('Scanner Path Not Found'),
+                setCookieHeader: null
+            };
+        }
+        return { blockedResponse: null, setCookieHeader: null };
+    }
+
     if (await isIpBanned(clientIp, env, now)) {
         return {
             blockedResponse: createForbiddenResponse('IP Address Banned'),
@@ -467,6 +537,7 @@ export function createEdgeHoneypotMiddleware({
         if (!response || !response.headers) return response;
 
         const isNonProd = prodHosts.length > 0 && isNonProductionHost(url && url.hostname, prodHosts);
+        const isErrorStatus = typeof response.status === 'number' && response.status >= 400;
         const contentType = (response.headers.get('Content-Type') || '').toLowerCase();
         const isHtml = contentType.includes('text/html');
         const isHead = Boolean(request && request.method === 'HEAD');
@@ -480,7 +551,7 @@ export function createEdgeHoneypotMiddleware({
             }
         }
 
-        if (isNonProd) {
+        if (isNonProd || isErrorStatus) {
             headers.set('X-Robots-Tag', 'noindex, nofollow');
         }
 
@@ -497,7 +568,7 @@ export function createEdgeHoneypotMiddleware({
             });
         }
 
-        if (!isNonProd && !securityHeaders) {
+        if (!isNonProd && !isErrorStatus && !securityHeaders) {
             return response;
         }
 
@@ -526,7 +597,8 @@ export function createEdgeHoneypotMiddleware({
                             'Content-Type': 'text/plain; charset=utf-8',
                             'Cache-Control': 'no-store',
                             'CDN-Cache-Control': 'no-store',
-                            'X-Content-Type-Options': 'nosniff'
+                            'X-Content-Type-Options': 'nosniff',
+                            'X-Robots-Tag': 'noindex, nofollow'
                         }
                     })
                 );

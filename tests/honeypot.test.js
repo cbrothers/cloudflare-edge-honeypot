@@ -5,7 +5,8 @@ import {
     clearBannedIps,
     createEdgeHoneypotMiddleware,
     deriveOverrideToken,
-    isScannerPath
+    isScannerPath,
+    isVerifiedCrawler
 } from '../src/index.js';
 
 describe('cloudflare-edge-honeypot shared module', () => {
@@ -31,6 +32,8 @@ describe('cloudflare-edge-honeypot shared module', () => {
         assert.equal(isScannerPath('/discography.html'), false);
         assert.equal(isScannerPath('/privacy-policy.html'), false);
         assert.equal(isScannerPath('/__health'), false);
+        assert.equal(isScannerPath('/cdn-cgi/rum'), false);
+        assert.equal(isScannerPath('/custom.php', { safePaths: ['/custom.php'] }), false);
     });
 
     test('createEdgeHoneypotMiddleware serves /__health, bans scanners for 24h in memory + KV, and supports owner override', async () => {
@@ -108,5 +111,64 @@ describe('cloudflare-edge-honeypot shared module', () => {
         assert.equal(stageRes.status, 200);
         assert.equal(stageRes.headers.get('X-Robots-Tag'), 'noindex, nofollow');
         assert.match(await stageRes.text(), /noindex, nofollow/);
+    });
+
+    test('never bans verified search crawlers (Googlebot), auto-heals pre-banned crawler IPs, and returns 404 + noindex on scanner paths', async () => {
+        clearBannedIps();
+        const { onRequest } = createEdgeHoneypotMiddleware({
+            apexHostname: 'example.com',
+            wwwHostname: 'www.example.com'
+        });
+
+        const kvStore = new Map();
+        const env = {
+            SECURITY_BANS: {
+                get: async (k) => kvStore.get(k) || null,
+                put: async (k, v) => kvStore.set(k, v),
+                delete: async (k) => kvStore.delete(k)
+            }
+        };
+
+        const googlebotIp = '66.249.66.1';
+        assert.equal(
+            isVerifiedCrawler(
+                new Request('https://www.example.com/', {
+                    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' }
+                }),
+                googlebotIp
+            ),
+            true
+        );
+
+        // Pre-seed a ban for Googlebot IP to verify auto-healing
+        kvStore.set(`ban:${googlebotIp}`, JSON.stringify({ ip: googlebotIp, expiresAt: Date.now() + 60000 }));
+        bannedIps.set(googlebotIp, Date.now() + 60000);
+
+        const crawlerScanRes = await onRequest({
+            request: new Request('https://www.example.com/wp-login.php', {
+                headers: {
+                    'CF-Connecting-IP': googlebotIp,
+                    'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+                }
+            }),
+            env,
+            next: async () => new Response('OK', { status: 200 })
+        });
+        assert.equal(crawlerScanRes.status, 404);
+        assert.equal(crawlerScanRes.headers.get('X-Robots-Tag'), 'noindex, nofollow');
+        assert.equal(bannedIps.has(googlebotIp), false);
+        assert.equal(kvStore.has(`ban:${googlebotIp}`), false);
+
+        const crawlerHomeRes = await onRequest({
+            request: new Request('https://www.example.com/', {
+                headers: {
+                    'CF-Connecting-IP': googlebotIp,
+                    'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+                }
+            }),
+            env,
+            next: async () => new Response('OK', { status: 200 })
+        });
+        assert.equal(crawlerHomeRes.status, 200);
     });
 });
