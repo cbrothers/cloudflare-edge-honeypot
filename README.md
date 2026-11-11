@@ -188,10 +188,10 @@ npx wrangler pages secret put STUDIO_OVERRIDE_KEY --project-name <pages-project>
 import { createEdgeHoneypotMiddleware } from './honeypot/src/index.js';
 
 export const { onRequest } = createEdgeHoneypotMiddleware({
-    apexHostname: 'brothersblues.com',
-    wwwHostname: 'www.brothersblues.com',
-    overrideCookieName: '__bb_studio_override',
-    tokenPrefix: 'bb_ovr'
+    apexHostname: 'example.com',
+    wwwHostname: 'www.example.com',
+    overrideCookieName: '__example_studio_override',
+    tokenPrefix: 'ex_ovr'
 });
 ```
 
@@ -290,7 +290,7 @@ export async function onRequest(context) {
 | `apexHostname` | `string` | none | Production apex hostname, for example `example.com`. |
 | `wwwHostname` | `string` | none | Production `www` hostname. |
 | `overrideCookieName` | `string` | `__studio_override` | Name of the owner override cookie. Use a distinct name per site. |
-| `tokenPrefix` | `string` | `eg_ovr` | Prefix of the derived cookie token. A distinct prefix per site means a cookie from one site is not valid on another, even when they share a secret. |
+| `tokenPrefix` | `string` | `ovr` | Prefix of the derived cookie token. A distinct prefix per site means a cookie from one site is not valid on another, even when they share a secret. |
 | `allowPaths` | `Set<string>` or `string[]` | `null` | Paths exempt from scanner detection. Compared against the decoded, lower-cased path, with and without a trailing slash. Exact match only, no prefixes or wildcards. |
 | `securityHeaders` | `object` | `null` | Header name to value. Each is added to every response that does not already set it. |
 

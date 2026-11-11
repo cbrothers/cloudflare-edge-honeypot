@@ -150,7 +150,7 @@ export function constantTimeEqual(a, b) {
 /**
  * Derives a deterministic token for the HttpOnly override cookie.
  */
-export function deriveOverrideToken(secret, prefix = 'eg_ovr') {
+export function deriveOverrideToken(secret, prefix = 'ovr') {
     if (typeof secret !== 'string' || !secret.trim()) return '';
     const trimmed = secret.trim();
     let h1 = 0x811c9dc5;
@@ -341,7 +341,7 @@ export function parseCookies(cookieHeader) {
 export function hasValidOverrideCookie(
     request,
     env,
-    { cookieName = DEFAULT_OVERRIDE_COOKIE_NAME, tokenPrefix = 'eg_ovr', fallbackSecret = '' } = {}
+    { cookieName = DEFAULT_OVERRIDE_COOKIE_NAME, tokenPrefix = 'ovr', fallbackSecret = '' } = {}
 ) {
     const secret = getOverrideSecret(env, fallbackSecret);
     if (!secret || !request || !request.headers) return false;
@@ -374,7 +374,7 @@ export function hasValidOverrideSupply(request, url, env, { fallbackSecret = '' 
 
 export function buildOverrideCookieHeader(
     secret,
-    { cookieName = DEFAULT_OVERRIDE_COOKIE_NAME, tokenPrefix = 'eg_ovr', maxAge = OVERRIDE_COOKIE_MAX_AGE } = {}
+    { cookieName = DEFAULT_OVERRIDE_COOKIE_NAME, tokenPrefix = 'ovr', maxAge = OVERRIDE_COOKIE_MAX_AGE } = {}
 ) {
     const token = deriveOverrideToken(secret, tokenPrefix);
     return `${cookieName}=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
@@ -551,7 +551,7 @@ export async function evaluateHoneypotRequest({
     env = {},
     now = Date.now(),
     cookieName = DEFAULT_OVERRIDE_COOKIE_NAME,
-    tokenPrefix = 'eg_ovr',
+    tokenPrefix = 'ovr',
     allowPaths = null
 }) {
     const clientIp = getClientIp(request);
@@ -647,7 +647,7 @@ export function createEdgeHoneypotMiddleware({
     apexHostname,
     wwwHostname,
     overrideCookieName = DEFAULT_OVERRIDE_COOKIE_NAME,
-    tokenPrefix = 'eg_ovr',
+    tokenPrefix = 'ovr',
     allowPaths = null,
     securityHeaders = null
 } = {}) {
