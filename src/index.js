@@ -15,8 +15,21 @@ export const MAX_IN_MEMORY_BANS = 10000;
  */
 export const bannedIps = new Map();
 
+/**
+ * How long a "not banned" answer from KV is trusted before KV is asked again.
+ */
+export const NEGATIVE_BAN_CACHE_TTL_MS = 60 * 1000;
+
+/**
+ * In-memory negative cache mapping IP -> timestamp (ms) until which the IP is
+ * known not to be banned in KV. Saves one KV read per request for clean visitors.
+ * @type {Map<string, number>}
+ */
+export const notBannedIps = new Map();
+
 export function clearBannedIps() {
     bannedIps.clear();
+    notBannedIps.clear();
 }
 
 export const SCANNER_SEGMENTS = [
@@ -34,7 +47,6 @@ export const SCANNER_SEGMENTS = [
     '/vendor/phpunit',
     '/cgi-bin',
     '/actuator',
-    '/admin',
     '/service-account.json',
     '/firebase-adminsdk',
     '/gcp-credentials.json',
@@ -54,6 +66,22 @@ export const DOTFILE_SEGMENT_REGEX =
 export const SCANNER_EXTENSIONS_REGEX =
     /\.(?:php\d?|phtml|asp|aspx|jsp|jspx|cgi|env|sql|bak|old|orig|swp|ini|conf|yml|yaml|properties)(?:$|\/)/i;
 
+/**
+ * Strong signals: no static site serves these, so one request bans the client.
+ */
+export const STRONG_SCANNER_EXTENSIONS_REGEX =
+    /\.(?:php\d?|phtml|asp|aspx|jsp|jspx|cgi|env|sql|swp)(?:$|\/)/i;
+
+/**
+ * Weak signals: suspicious, but plausible on a real site or in a mistyped link.
+ * The request is refused, but the client is not banned.
+ */
+export const WEAK_SCANNER_EXTENSIONS_REGEX =
+    /\.(?:bak|old|orig|ini|conf|yml|yaml|properties)(?:$|\/)/i;
+export const WEAK_SCANNER_SEGMENTS = ['/admin'];
+
+const PARENT_SEGMENT_REGEX = /(?:^|\/)\.\.(?:\/|$)/;
+
 export const VERIFIED_CRAWLER_UA_REGEX =
     /\b(?:googlebot|google-inspectiontool|googleother|storebot-google|adsbot-google|mediapartners-google|apis-google|bingbot|adidxbot|applebot|duckduckbot|slurp|baiduspider|yandexbot|facebookexternalhit|facebot|linkedinbot|twitterbot|slackbot|discordbot)\b/i;
 
@@ -65,25 +93,40 @@ export const GOOGLEBOT_IP_PREFIXES = [
 ];
 
 /**
+ * Autonomous systems operated by the crawler owners named in
+ * VERIFIED_CRAWLER_UA_REGEX: Google, Microsoft (Bing), Apple, Yandex, Meta,
+ * LinkedIn, X/Twitter and Baidu. Compared against `request.cf.asn`.
+ */
+export const VERIFIED_CRAWLER_ASNS = new Set([15169, 8075, 714, 13238, 32934, 14413, 13414, 55967]);
+
+/**
  * Detects verified search engine and social preview crawlers so they are never
  * written to the 24-hour cross-domain IP ban table and receive 404 + noindex on
  * missing/scanner URLs instead of 403 blocks.
+ *
+ * A crawler User-Agent is never trusted on its own, because any client can send
+ * one. It only counts when Cloudflare's network data corroborates it.
  */
 export function isVerifiedCrawler(request, clientIp = '') {
-    if (request && request.cf && request.cf.botManagement && request.cf.botManagement.verifiedBot === true) {
+    const cf = request && request.cf ? request.cf : null;
+    if (cf && cf.botManagement && cf.botManagement.verifiedBot === true) {
         return true;
     }
     const ip = (clientIp || getClientIp(request) || '').trim().toLowerCase();
     if (ip && GOOGLEBOT_IP_PREFIXES.some((prefix) => ip.startsWith(prefix))) {
         return true;
     }
-    if (request && request.headers && typeof request.headers.get === 'function') {
-        const ua = request.headers.get('User-Agent') || request.headers.get('user-agent') || '';
-        if (ua && VERIFIED_CRAWLER_UA_REGEX.test(ua)) {
-            return true;
-        }
+    if (!cf || !request.headers || typeof request.headers.get !== 'function') {
+        return false;
     }
-    return false;
+    const ua = request.headers.get('User-Agent') || '';
+    if (!ua || !VERIFIED_CRAWLER_UA_REGEX.test(ua)) {
+        return false;
+    }
+    if (typeof cf.verifiedBotCategory === 'string' && cf.verifiedBotCategory.trim()) {
+        return true;
+    }
+    return VERIFIED_CRAWLER_ASNS.has(Number(cf.asn));
 }
 
 /**
@@ -123,19 +166,55 @@ export function deriveOverrideToken(secret, prefix = 'eg_ovr') {
 }
 
 /**
- * Inspects a URL pathname for CMS, dotfile, cloud credential, or exploit scanner probes.
+ * Percent-decodes a string, leaving malformed escapes (e.g. a literal "50%-off")
+ * untouched instead of throwing.
  */
-export function isScannerPath(pathname, { allowPaths = null, safePaths = null } = {}) {
-    if (!pathname || typeof pathname !== 'string') return false;
-
-    let decoded = pathname;
+function lenientDecode(value) {
     try {
-        decoded = decodeURIComponent(pathname);
-        if (decoded.includes('%')) {
-            decoded = decodeURIComponent(decoded);
-        }
+        return decodeURIComponent(value);
     } catch {
-        return true;
+        return value.replace(/(?:%[0-9a-f]{2})+/gi, (run) => {
+            try {
+                return decodeURIComponent(run);
+            } catch {
+                return run;
+            }
+        });
+    }
+}
+
+function hasScannerSegment(normalized, segments, boundaryChars) {
+    for (const seg of segments) {
+        let idx = normalized.indexOf(seg);
+        while (idx !== -1) {
+            const after = normalized[idx + seg.length];
+            if (after === undefined || boundaryChars.includes(after)) {
+                return true;
+            }
+            idx = normalized.indexOf(seg, idx + 1);
+        }
+    }
+    return false;
+}
+
+/**
+ * Inspects a URL pathname for CMS, dotfile, cloud credential, or exploit scanner probes.
+ * Returns true for both strong and weak signals; see classifyScannerPath.
+ */
+export function isScannerPath(pathname, options = {}) {
+    return classifyScannerPath(pathname, options) !== null;
+}
+
+/**
+ * Classifies a URL pathname as a scanner probe.
+ * Returns 'strong' (refuse and ban), 'weak' (refuse, do not ban) or null (not a probe).
+ */
+export function classifyScannerPath(pathname, { allowPaths = null, safePaths = null } = {}) {
+    if (!pathname || typeof pathname !== 'string') return null;
+
+    let decoded = lenientDecode(pathname);
+    if (decoded.includes('%')) {
+        decoded = lenientDecode(decoded);
     }
 
     const normalized = decoded.replace(/\\/g, '/').replace(/\/+/g, '/').toLowerCase();
@@ -153,7 +232,7 @@ export function isScannerPath(pathname, { allowPaths = null, safePaths = null } 
         normalized === '/favicon.ico' ||
         normalized.startsWith('/cdn-cgi/')
     ) {
-        return false;
+        return null;
     }
 
     const effectiveAllowPaths = allowPaths || safePaths;
@@ -162,42 +241,43 @@ export function isScannerPath(pathname, { allowPaths = null, safePaths = null } 
             typeof effectiveAllowPaths.has === 'function' &&
             (effectiveAllowPaths.has(normalized) || effectiveAllowPaths.has(trimmed))
         ) {
-            return false;
+            return null;
         }
         if (
             Array.isArray(effectiveAllowPaths) &&
             (effectiveAllowPaths.includes(normalized) || effectiveAllowPaths.includes(trimmed))
         ) {
-            return false;
+            return null;
         }
     }
 
-    if (normalized.includes('..') || normalized.includes('\0')) {
-        return true;
+    // A ".." path segment, not any two dots: "/blog/wait...what" is an ordinary URL.
+    if (PARENT_SEGMENT_REGEX.test(normalized) || normalized.includes('\0')) {
+        return 'strong';
     }
 
     if (DOTFILE_SEGMENT_REGEX.test(normalized)) {
-        return true;
+        return 'strong';
     }
 
-    for (const seg of SCANNER_SEGMENTS) {
-        let searchFrom = 0;
-        let idx = normalized.indexOf(seg, searchFrom);
-        while (idx !== -1) {
-            const after = normalized[idx + seg.length];
-            if (after === undefined || after === '/' || after === '.' || after === '-' || after === '_') {
-                return true;
-            }
-            searchFrom = idx + 1;
-            idx = normalized.indexOf(seg, searchFrom);
-        }
+    if (hasScannerSegment(normalized, SCANNER_SEGMENTS, '/.-_')) {
+        return 'strong';
     }
 
-    if (SCANNER_EXTENSIONS_REGEX.test(normalized)) {
-        return true;
+    if (STRONG_SCANNER_EXTENSIONS_REGEX.test(normalized)) {
+        return 'strong';
     }
 
-    return false;
+    // Weak segments must be a whole path segment: "/admin" and "/admin/x", not "/admin-guide".
+    if (hasScannerSegment(normalized, WEAK_SCANNER_SEGMENTS, '/')) {
+        return 'weak';
+    }
+
+    if (WEAK_SCANNER_EXTENSIONS_REGEX.test(normalized)) {
+        return 'weak';
+    }
+
+    return null;
 }
 
 export function getClientIp(request) {
@@ -300,16 +380,33 @@ export function buildOverrideCookieHeader(
     return `${cookieName}=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
 }
 
+/**
+ * Checks only the in-memory ban table. Synchronous and free of KV calls.
+ */
+export function isIpBannedInMemory(clientIp, now = Date.now()) {
+    if (!clientIp) return false;
+    const normalizedIp = clientIp.trim().toLowerCase();
+    const memExpiry = bannedIps.get(normalizedIp);
+    if (typeof memExpiry !== 'number') return false;
+    if (memExpiry > now) return true;
+    bannedIps.delete(normalizedIp);
+    return false;
+}
+
 export async function isIpBanned(clientIp, env, now = Date.now()) {
     if (!clientIp) return false;
     const normalizedIp = clientIp.trim().toLowerCase();
 
-    const memExpiry = bannedIps.get(normalizedIp);
-    if (typeof memExpiry === 'number') {
-        if (memExpiry > now) {
-            return true;
+    if (isIpBannedInMemory(normalizedIp, now)) {
+        return true;
+    }
+
+    const notBannedUntil = notBannedIps.get(normalizedIp);
+    if (typeof notBannedUntil === 'number') {
+        if (notBannedUntil > now) {
+            return false;
         }
-        bannedIps.delete(normalizedIp);
+        notBannedIps.delete(normalizedIp);
     }
 
     if (env && env.SECURITY_BANS && typeof env.SECURITY_BANS.get === 'function') {
@@ -328,6 +425,11 @@ export async function isIpBanned(clientIp, env, now = Date.now()) {
                     return true;
                 }
             }
+            // KV answered "not banned": remember it so the next requests skip the read.
+            if (notBannedIps.size >= MAX_IN_MEMORY_BANS) {
+                notBannedIps.clear();
+            }
+            notBannedIps.set(normalizedIp, now + NEGATIVE_BAN_CACHE_TTL_MS);
         } catch {}
     }
 
@@ -350,6 +452,7 @@ export async function banIp(clientIp, pathname, env, now = Date.now()) {
     }
 
     bannedIps.set(normalizedIp, expiresAt);
+    notBannedIps.delete(normalizedIp);
 
     if (env && env.SECURITY_BANS && typeof env.SECURITY_BANS.put === 'function') {
         try {
@@ -490,7 +593,8 @@ export async function evaluateHoneypotRequest({
     // Verified search engine and social preview crawlers are never banned in memory or KV.
     // If a crawler IP was previously banned, auto-heal it and return 404 + noindex on scanner paths.
     if (isVerifiedCrawler(request, clientIp)) {
-        if (clientIp) {
+        // Only touch KV when a ban actually exists: deletes are a scarce quota.
+        if (clientIp && (await isIpBanned(clientIp, env, now))) {
             await unbanIp(clientIp, env);
         }
         if (isScannerPath(url.pathname, { allowPaths })) {
@@ -502,17 +606,33 @@ export async function evaluateHoneypotRequest({
         return { blockedResponse: null, setCookieHeader: null };
     }
 
-    if (await isIpBanned(clientIp, env, now)) {
+    // Cheapest checks first: memory, then the path itself, and KV only for
+    // requests that would otherwise be let through.
+    if (isIpBannedInMemory(clientIp, now)) {
         return {
             blockedResponse: createForbiddenResponse('IP Address Banned'),
             setCookieHeader: null
         };
     }
 
-    if (isScannerPath(url.pathname, { allowPaths })) {
+    const probe = classifyScannerPath(url.pathname, { allowPaths });
+    if (probe === 'strong') {
         await banIp(clientIp, url.pathname, env, now);
         return {
             blockedResponse: createForbiddenResponse('Honeypot Triggered'),
+            setCookieHeader: null
+        };
+    }
+    if (probe === 'weak') {
+        return {
+            blockedResponse: createForbiddenResponse('Scanner Probe Blocked'),
+            setCookieHeader: null
+        };
+    }
+
+    if (await isIpBanned(clientIp, env, now)) {
+        return {
+            blockedResponse: createForbiddenResponse('IP Address Banned'),
             setCookieHeader: null
         };
     }

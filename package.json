@@ -1,6 +1,6 @@
 {
   "name": "cloudflare-edge-honeypot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Shared Cloudflare Workers and Pages edge honeypot, scanner trap, 24-hour KV IP ban, and staging noindex middleware.",
   "main": "src/index.js",
   "exports": {
