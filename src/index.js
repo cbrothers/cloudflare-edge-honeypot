@@ -57,8 +57,7 @@ export const SCANNER_SEGMENTS = [
     '/next.config.js',
     '/server-status',
     '/telescope/requests',
-    '/_ignition/execute-solution',
-    '/autodiscover/autodiscover.xml'
+    '/_ignition/execute-solution'
 ];
 
 export const DOTFILE_SEGMENT_REGEX =

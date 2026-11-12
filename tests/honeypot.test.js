@@ -293,6 +293,8 @@ describe('cloudflare-edge-honeypot shared module', () => {
         assert.equal(isScannerPath('/sale-50%-off'), false);
         assert.equal(isScannerPath('/admin-guide'), false);
         assert.equal(isScannerPath('/blog/admin.html'), false);
+        assert.equal(isScannerPath('/AutoDiscover/autodiscover.xml'), false);
+        assert.equal(isScannerPath('/autodiscover/autodiscover.xml'), false);
 
         // Traversal and encoded probes are still caught, including beside a malformed escape.
         assert.equal(classifyScannerPath('/static/..%2f..%2fetc/passwd'), 'strong');
