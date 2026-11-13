@@ -57,19 +57,24 @@ export const SCANNER_SEGMENTS = [
     '/next.config.js',
     '/server-status',
     '/telescope/requests',
-    '/_ignition/execute-solution'
+    '/_ignition/execute-solution',
+    '/elmah.axd',
+    '/metrics',
+    '/.codex/auth.json',
+    '/.gemini/settings.json',
+    '/.claude/.credentials.json'
 ];
 
 export const DOTFILE_SEGMENT_REGEX =
-    /(?:^|\/)\.(?:env|git|aws|ssh|docker|vscode|ds_store)(?:$|\.|\/|;)/i;
+    /(?:^|\/)\.(?:env|git|aws|ssh|docker|vscode|codex|claude|gemini|ds_store)(?:$|\.|\/|;)/i;
 export const SCANNER_EXTENSIONS_REGEX =
-    /\.(?:php\d?|phtml|asp|aspx|jsp|jspx|cgi|env|sql|bak|old|orig|swp|ini|conf|yml|yaml|properties)(?:$|\/)/i;
+    /\.(?:php\d?|phtml|asp|aspx|axd|jsp|jspx|cgi|env|sql|cnf|key|bak|old|orig|swp|ini|conf|yml|yaml|properties)(?:$|\/)/i;
 
 /**
  * Strong signals: no static site serves these, so one request bans the client.
  */
 export const STRONG_SCANNER_EXTENSIONS_REGEX =
-    /\.(?:php\d?|phtml|asp|aspx|jsp|jspx|cgi|env|sql|swp)(?:$|\/)/i;
+    /\.(?:php\d?|phtml|asp|aspx|axd|jsp|jspx|cgi|env|sql|cnf|key|swp)(?:$|\/)/i;
 
 /**
  * Weak signals: suspicious, but plausible on a real site or in a mistyped link.

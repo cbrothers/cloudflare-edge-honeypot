@@ -31,6 +31,13 @@ describe('cloudflare-edge-honeypot shared module', () => {
         assert.equal(isScannerPath('/application-prod.properties'), true);
         assert.equal(isScannerPath('/admin/reports'), true);
         assert.equal(isScannerPath('//images/images/cache.php'), true);
+        assert.equal(isScannerPath('/metrics'), true);
+        assert.equal(isScannerPath('/elmah.axd'), true);
+        assert.equal(isScannerPath('/.codex/auth.json'), true);
+        assert.equal(isScannerPath('/.claude/.credentials.json'), true);
+        assert.equal(isScannerPath('/.gemini/settings.json'), true);
+        assert.equal(isScannerPath('/config/master.key'), true);
+        assert.equal(isScannerPath('/my.cnf'), true);
 
         assert.equal(isScannerPath('/'), false);
         assert.equal(isScannerPath('/index.html'), false);
