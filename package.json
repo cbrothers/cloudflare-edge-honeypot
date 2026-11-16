@@ -8,7 +8,8 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test tests/honeypot.test.js"
+    "test": "node --test tests/honeypot.test.js",
+    "stats": "node scripts/honeypot-stats.mjs"
   },
   "repository": {
     "type": "git",
