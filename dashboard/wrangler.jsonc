@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-hp-stats",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-01",
+  "account_id": "3fd61ce34cc15f05d0af93a665d5f49f",
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "cf-hp-stats.emerald-glen.com",
+      "custom_domain": true,
+      "zone_name": "emerald-glen.com"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "SECURITY_BANS",
+      "id": "8042e1b5ee4b42279489114046987cf6"
+    }
+  ]
+}
