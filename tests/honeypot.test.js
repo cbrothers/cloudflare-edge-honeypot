@@ -8,10 +8,12 @@ import {
     clearBannedIps,
     createEdgeHoneypotMiddleware,
     deriveOverrideToken,
+    getCustomRules,
     isIpBanned,
     isScannerPath,
     isVerifiedCrawler,
-    notBannedIps
+    notBannedIps,
+    saveCustomRules
 } from '../src/index.js';
 
 describe('cloudflare-edge-honeypot shared module', () => {
@@ -443,5 +445,31 @@ describe('cloudflare-edge-honeypot shared module', () => {
         assert.equal(await isIpBanned(ip, env, t0 + NEGATIVE_BAN_CACHE_TTL_MS - 1), false);
         assert.equal(await isIpBanned(ip, env, t0 + NEGATIVE_BAN_CACHE_TTL_MS + 1), true);
         assert.equal(kv.calls.get, 2);
+    });
+
+    test('saveCustomRules and getCustomRules allow dynamic KV rule overrides (strong, weak, allow, and disabled)', async () => {
+        clearBannedIps();
+        const kv = createCountingKv();
+        const env = { SECURITY_BANS: kv.binding };
+
+        const saved = await saveCustomRules(
+            {
+                strongSegments: ['/custom-trap-99'],
+                weakSegments: ['/custom-soft-block'],
+                allowPaths: ['/wp-json/custom-public'],
+                disabledSegments: ['/metrics']
+            },
+            env
+        );
+        assert.deepEqual(saved.strongSegments, ['/custom-trap-99']);
+        assert.deepEqual(saved.weakSegments, ['/custom-soft-block']);
+        assert.deepEqual(saved.allowPaths, ['/wp-json/custom-public']);
+        assert.deepEqual(saved.disabledSegments, ['/metrics']);
+
+        const loaded = await getCustomRules(env);
+        assert.equal(classifyScannerPath('/custom-trap-99/login', { customRules: loaded }), 'strong');
+        assert.equal(classifyScannerPath('/custom-soft-block/sub', { customRules: loaded }), 'weak');
+        assert.equal(classifyScannerPath('/wp-json/custom-public', { customRules: loaded }), null);
+        assert.equal(classifyScannerPath('/metrics', { customRules: loaded }), null);
     });
 });

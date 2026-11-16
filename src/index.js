@@ -19,6 +19,8 @@ export const bannedIps = new Map();
  * How long a "not banned" answer from KV is trusted before KV is asked again.
  */
 export const NEGATIVE_BAN_CACHE_TTL_MS = 60 * 1000;
+export const CUSTOM_RULES_KV_KEY = 'config:rules';
+export const CUSTOM_RULES_CACHE_TTL_MS = 60 * 1000;
 
 /**
  * In-memory negative cache mapping IP -> timestamp (ms) until which the IP is
@@ -27,9 +29,83 @@ export const NEGATIVE_BAN_CACHE_TTL_MS = 60 * 1000;
  */
 export const notBannedIps = new Map();
 
+let cachedCustomRules = null;
+let cachedCustomRulesUntil = 0;
+
 export function clearBannedIps() {
     bannedIps.clear();
     notBannedIps.clear();
+    cachedCustomRules = null;
+    cachedCustomRulesUntil = 0;
+}
+
+export function normalizeRuleList(list) {
+    if (!Array.isArray(list)) return [];
+    const seen = new Set();
+    const out = [];
+    for (const raw of list) {
+        if (typeof raw !== 'string') continue;
+        let s = raw.trim().toLowerCase();
+        if (!s) continue;
+        if (!s.startsWith('/')) s = `/${s}`;
+        if (s.length > 1) s = s.replace(/\/+$/, '');
+        if (!seen.has(s)) {
+            seen.add(s);
+            out.push(s);
+        }
+    }
+    return out;
+}
+
+export async function getCustomRules(env, now = Date.now()) {
+    if (cachedCustomRules && cachedCustomRulesUntil > now) {
+        return cachedCustomRules;
+    }
+    const empty = {
+        strongSegments: [],
+        weakSegments: [],
+        allowPaths: [],
+        disabledSegments: [],
+        updatedAt: null
+    };
+    if (!env || !env.SECURITY_BANS || typeof env.SECURITY_BANS.get !== 'function') {
+        return empty;
+    }
+    try {
+        const raw = await env.SECURITY_BANS.get(CUSTOM_RULES_KV_KEY);
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            cachedCustomRules = {
+                strongSegments: normalizeRuleList(parsed.strongSegments),
+                weakSegments: normalizeRuleList(parsed.weakSegments),
+                allowPaths: normalizeRuleList(parsed.allowPaths),
+                disabledSegments: normalizeRuleList(parsed.disabledSegments),
+                updatedAt: parsed.updatedAt || null
+            };
+        } else {
+            cachedCustomRules = empty;
+        }
+        cachedCustomRulesUntil = now + CUSTOM_RULES_CACHE_TTL_MS;
+        return cachedCustomRules;
+    } catch {
+        return empty;
+    }
+}
+
+export async function saveCustomRules(rules, env, now = Date.now()) {
+    const normalized = {
+        strongSegments: normalizeRuleList(rules && rules.strongSegments),
+        weakSegments: normalizeRuleList(rules && rules.weakSegments),
+        allowPaths: normalizeRuleList(rules && rules.allowPaths),
+        disabledSegments: normalizeRuleList(rules && rules.disabledSegments),
+        updatedAt: new Date(now).toISOString()
+    };
+    cachedCustomRules = normalized;
+    cachedCustomRulesUntil = now + CUSTOM_RULES_CACHE_TTL_MS;
+    if (env && env.SECURITY_BANS && typeof env.SECURITY_BANS.put === 'function') {
+        await env.SECURITY_BANS.put(CUSTOM_RULES_KV_KEY, JSON.stringify(normalized));
+    }
+    return normalized;
 }
 
 export const SCANNER_SEGMENTS = [
@@ -334,7 +410,10 @@ export function isScannerPath(pathname, options = {}) {
  * Classifies a URL pathname as a scanner probe.
  * Returns 'strong' (refuse and ban), 'weak' (refuse, do not ban) or null (not a probe).
  */
-export function classifyScannerPath(pathname, { allowPaths = null, safePaths = null } = {}) {
+export function classifyScannerPath(
+    pathname,
+    { allowPaths = null, safePaths = null, customRules = null } = {}
+) {
     if (!pathname || typeof pathname !== 'string') return null;
 
     let decoded = lenientDecode(pathname);
@@ -376,6 +455,42 @@ export function classifyScannerPath(pathname, { allowPaths = null, safePaths = n
         }
     }
 
+    if (customRules) {
+        if (
+            Array.isArray(customRules.allowPaths) &&
+            (customRules.allowPaths.includes(normalized) ||
+                customRules.allowPaths.includes(trimmed) ||
+                hasScannerSegment(normalized, customRules.allowPaths, '/'))
+        ) {
+            return null;
+        }
+        if (
+            Array.isArray(customRules.strongSegments) &&
+            customRules.strongSegments.length > 0 &&
+            hasScannerSegment(normalized, customRules.strongSegments, '/.-_')
+        ) {
+            return 'strong';
+        }
+        if (
+            Array.isArray(customRules.weakSegments) &&
+            customRules.weakSegments.length > 0 &&
+            hasScannerSegment(normalized, customRules.weakSegments, '/')
+        ) {
+            return 'weak';
+        }
+    }
+
+    const disabledSet =
+        customRules && Array.isArray(customRules.disabledSegments) && customRules.disabledSegments.length > 0
+            ? new Set(customRules.disabledSegments)
+            : null;
+    const activeStrongSegments = disabledSet
+        ? SCANNER_SEGMENTS.filter((s) => !disabledSet.has(s))
+        : SCANNER_SEGMENTS;
+    const activeWeakSegments = disabledSet
+        ? WEAK_SCANNER_SEGMENTS.filter((s) => !disabledSet.has(s))
+        : WEAK_SCANNER_SEGMENTS;
+
     // A ".." path segment, not any two dots: "/blog/wait...what" is an ordinary URL.
     if (PARENT_SEGMENT_REGEX.test(normalized) || normalized.includes('\0')) {
         return 'strong';
@@ -385,7 +500,7 @@ export function classifyScannerPath(pathname, { allowPaths = null, safePaths = n
         return 'strong';
     }
 
-    if (hasScannerSegment(normalized, SCANNER_SEGMENTS, '/.-_')) {
+    if (hasScannerSegment(normalized, activeStrongSegments, '/.-_')) {
         return 'strong';
     }
 
@@ -394,7 +509,7 @@ export function classifyScannerPath(pathname, { allowPaths = null, safePaths = n
     }
 
     // Weak segments must be a whole path segment: "/admin" and "/admin/x", not "/admin-guide".
-    if (hasScannerSegment(normalized, WEAK_SCANNER_SEGMENTS, '/')) {
+    if (hasScannerSegment(normalized, activeWeakSegments, '/')) {
         return 'weak';
     }
 
@@ -682,13 +797,16 @@ export async function evaluateHoneypotRequest({
     const clientIp = getClientIp(request);
     let setCookieHeader = null;
 
+    // Use already-cached in-memory custom rules (zero KV reads on fast path)
+    const customRules = cachedCustomRules && cachedCustomRulesUntil > now ? cachedCustomRules : null;
+
     const overrideCheck = hasValidOverrideSupply(request, url, env);
     if (overrideCheck.matched) {
         await unbanIp(clientIp, env);
         const secret = getOverrideSecret(env);
         setCookieHeader = buildOverrideCookieHeader(secret, { cookieName, tokenPrefix });
 
-        if (isScannerPath(url.pathname, { allowPaths })) {
+        if (isScannerPath(url.pathname, { allowPaths, customRules })) {
             return {
                 blockedResponse: createForbiddenResponse(
                     'Scanner Probe Blocked // Owner Override Active',
@@ -706,7 +824,7 @@ export async function evaluateHoneypotRequest({
         if (clientIp && bannedIps.has(clientIp)) {
             await unbanIp(clientIp, env);
         }
-        if (isScannerPath(url.pathname, { allowPaths })) {
+        if (isScannerPath(url.pathname, { allowPaths, customRules })) {
             return {
                 blockedResponse: createForbiddenResponse('Scanner Probe Blocked // Exempt Owner IP'),
                 setCookieHeader: null
@@ -716,13 +834,13 @@ export async function evaluateHoneypotRequest({
     }
 
     // Verified search engine and social preview crawlers are never banned in memory or KV.
-    // If a crawler IP was previously banned, auto-heal it and return 404 + noindex on scanner paths.
+    // If a crawler IP was previously banned, auto-heals it and returns 404 + noindex on scanner paths.
     if (isVerifiedCrawler(request, clientIp)) {
         // Only touch KV when a ban actually exists: deletes are a scarce quota.
         if (clientIp && (await isIpBanned(clientIp, env, now))) {
             await unbanIp(clientIp, env);
         }
-        if (isScannerPath(url.pathname, { allowPaths })) {
+        if (isScannerPath(url.pathname, { allowPaths, customRules })) {
             return {
                 blockedResponse: createNotFoundScannerResponse('Scanner Path Not Found'),
                 setCookieHeader: null
@@ -731,8 +849,8 @@ export async function evaluateHoneypotRequest({
         return { blockedResponse: null, setCookieHeader: null };
     }
 
-    // Cheapest checks first: memory, then the path itself, and KV only for
-    // requests that would otherwise be let through.
+    // Cheapest checks first: memory, then the built-in static path rules, and KV only for
+    // requests that are not already caught by built-in strong traps.
     if (isIpBannedInMemory(clientIp, now)) {
         return {
             blockedResponse: createForbiddenResponse('IP Address Banned'),
@@ -740,7 +858,32 @@ export async function evaluateHoneypotRequest({
         };
     }
 
-    const probe = classifyScannerPath(url.pathname, { allowPaths });
+    const staticProbe = classifyScannerPath(url.pathname, { allowPaths, customRules });
+    if (staticProbe === 'strong') {
+        await banIp(clientIp, url.pathname, env, now);
+        return {
+            blockedResponse: createForbiddenResponse('Honeypot Triggered'),
+            setCookieHeader: null
+        };
+    }
+
+    // Load dynamic KV custom rules only when not already caught by a built-in strong trap
+    // and only when env.ENABLE_DYNAMIC_KV_RULES !== 'false' (or when config:rules exists).
+    let effectiveCustomRules = customRules;
+    if (
+        !effectiveCustomRules &&
+        env &&
+        env.SECURITY_BANS &&
+        (env.ENABLE_DYNAMIC_KV_RULES === 'true' || env.ENABLE_DYNAMIC_KV_RULES === true)
+    ) {
+        effectiveCustomRules = await getCustomRules(env, now);
+    }
+
+    const probe =
+        effectiveCustomRules !== customRules
+            ? classifyScannerPath(url.pathname, { allowPaths, customRules: effectiveCustomRules })
+            : staticProbe;
+
     if (probe === 'strong') {
         await banIp(clientIp, url.pathname, env, now);
         return {

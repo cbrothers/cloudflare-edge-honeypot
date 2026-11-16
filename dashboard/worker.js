@@ -1,9 +1,11 @@
 /**
- * Cloudflare Edge Honeypot Telemetry Dashboard Worker (`cf-hp-stats.emerald-glen.com`)
+ * Cloudflare Edge Honeypot Telemetry, All-Traffic Status Matrix & Rule Editor Dashboard Worker
+ * (`cf-hp-stats.emerald-glen.com`)
  *
  * Protected behind Cloudflare Access (`*.emerald-glen.com`).
  * - Directly reads/manages active 24h bans from `env.SECURITY_BANS` KV binding
- * - Queries multi-day HTTP trap telemetry across all 19 Cloudflare zones via `env.CF_ANALYTICS_TOKEN`
+ * - Reads/writes dynamic KV rule overrides (`config:rules` in `env.SECURITY_BANS`)
+ * - Queries all HTTP traffic, status codes, and trap telemetry across all 19 Cloudflare zones via `env.CF_ANALYTICS_TOKEN`
  */
 
 import {
@@ -11,7 +13,9 @@ import {
     BAN_TTL_SECONDS,
     SCANNER_SEGMENTS,
     WEAK_SCANNER_SEGMENTS,
-    classifyScannerPath
+    classifyScannerPath,
+    getCustomRules,
+    saveCustomRules
 } from '../src/index.js';
 
 let cachedZoneStats = {
@@ -68,21 +72,27 @@ async function listActiveBansFromKv(env) {
     return records.filter(Boolean).sort((a, b) => b.bannedAt - a.bannedAt);
 }
 
-async function fetchZoneTrapTelemetry(token, days = 7) {
+async function fetchZoneTrapTelemetry(token, days = 7, customRules = null) {
     if (!token) {
         return {
             configured: false,
             error: 'CF_ANALYTICS_TOKEN secret not configured yet.',
+            totalRequests: 0,
             totalTrapHits: 0,
             total403Blocks: 0,
             uniqueTrapPaths: 0,
+            statusSummary: [],
+            domainMatrix: [],
             zones: [],
-            paths: []
+            paths: [],
+            allTrafficRows: [],
+            uncaughtPaths: []
         };
     }
 
     const now = Date.now();
-    const cacheKey = `${days}`;
+    const rulesHash = customRules ? JSON.stringify(customRules) : '';
+    const cacheKey = `${days}:${rulesHash}`;
     if (cachedZoneStats.key === cacheKey && cachedZoneStats.expiresAt > now && cachedZoneStats.data) {
         return cachedZoneStats.data;
     }
@@ -98,11 +108,16 @@ async function fetchZoneTrapTelemetry(token, days = 7) {
         return {
             configured: true,
             error: `Cloudflare Zones API returned HTTP ${zonesRes.status}: ${errText.slice(0, 180)}`,
+            totalRequests: 0,
             totalTrapHits: 0,
             total403Blocks: 0,
             uniqueTrapPaths: 0,
+            statusSummary: [],
+            domainMatrix: [],
             zones: [],
-            paths: []
+            paths: [],
+            allTrafficRows: [],
+            uncaughtPaths: []
         };
     }
     const zonesJson = await zonesRes.json();
@@ -115,7 +130,17 @@ async function fetchZoneTrapTelemetry(token, days = 7) {
     query($zoneTag: string, $start: Time, $end: Time) {
       viewer {
         zones(filter: {zoneTag: $zoneTag}) {
-          httpRequestsAdaptiveGroups(
+          statusTotals: httpRequestsAdaptiveGroups(
+            limit: 100
+            filter: {datetime_geq: $start, datetime_leq: $end}
+            orderBy: [count_DESC]
+          ) {
+            count
+            dimensions {
+              edgeResponseStatus
+            }
+          }
+          pathGroups: httpRequestsAdaptiveGroups(
             limit: 500
             filter: {datetime_geq: $start, datetime_leq: $end}
             orderBy: [count_DESC]
@@ -123,6 +148,7 @@ async function fetchZoneTrapTelemetry(token, days = 7) {
             count
             dimensions {
               clientRequestHTTPHost
+              clientRequestHTTPMethodName
               clientRequestPath
               edgeResponseStatus
             }
@@ -132,7 +158,13 @@ async function fetchZoneTrapTelemetry(token, days = 7) {
     }`;
 
     const pathStats = new Map();
+    const uncaughtStats = new Map();
     const zoneTrapTotals = new Map();
+    const globalStatusCounts = new Map();
+    const domainMatrixMap = new Map();
+    const allTrafficList = [];
+
+    let totalRequests = 0;
     let totalTrapHits = 0;
     let total403Blocks = 0;
 
@@ -148,19 +180,61 @@ async function fetchZoneTrapTelemetry(token, days = 7) {
             });
             if (!r.ok) return;
             const res = await r.json();
-            const groups = res?.data?.viewer?.zones?.[0]?.httpRequestsAdaptiveGroups || [];
-            for (const g of groups) {
-                const p = g.dimensions.clientRequestPath;
-                const status = g.dimensions.edgeResponseStatus;
-                const cnt = g.count;
+            const zData = res?.data?.viewer?.zones?.[0] || {};
+            const statusGroups = zData.statusTotals || [];
+            const pathGroups = zData.pathGroups || [];
 
-                if (status === 403) {
+            const dMat = {
+                zone: z.name,
+                total: 0,
+                s2xx: 0,
+                s3xx: 0,
+                s403: 0,
+                s404: 0,
+                s4xxOther: 0,
+                s5xx: 0,
+                trapHits: 0
+            };
+
+            for (const sg of statusGroups) {
+                const st = Number(sg.dimensions.edgeResponseStatus) || 0;
+                const cnt = sg.count || 0;
+                totalRequests += cnt;
+                dMat.total += cnt;
+                globalStatusCounts.set(st, (globalStatusCounts.get(st) || 0) + cnt);
+
+                if (st >= 200 && st < 300) dMat.s2xx += cnt;
+                else if (st >= 300 && st < 400) dMat.s3xx += cnt;
+                else if (st === 403) {
+                    dMat.s403 += cnt;
                     total403Blocks += cnt;
-                }
+                } else if (st === 404) dMat.s404 += cnt;
+                else if (st >= 400 && st < 500) dMat.s4xxOther += cnt;
+                else if (st >= 500) dMat.s5xx += cnt;
+            }
 
-                const classification = classifyScannerPath(p);
+            for (const g of pathGroups) {
+                const p = g.dimensions.clientRequestPath;
+                const host = g.dimensions.clientRequestHTTPHost || z.name;
+                const method = g.dimensions.clientRequestHTTPMethodName || 'GET';
+                const status = Number(g.dimensions.edgeResponseStatus) || 0;
+                const cnt = g.count || 0;
+
+                const classification = classifyScannerPath(p, { customRules });
+
+                allTrafficList.push({
+                    zone: z.name,
+                    host,
+                    method,
+                    path: p,
+                    status,
+                    count: cnt,
+                    classification: classification || 'clean'
+                });
+
                 if (classification) {
                     totalTrapHits += cnt;
+                    dMat.trapHits += cnt;
                     zoneTrapTotals.set(z.name, (zoneTrapTotals.get(z.name) || 0) + cnt);
 
                     const existing = pathStats.get(p) || {
@@ -168,13 +242,37 @@ async function fetchZoneTrapTelemetry(token, days = 7) {
                         count: 0,
                         blocked403: 0,
                         type: classification,
+                        statuses: new Set(),
                         zones: new Set()
                     };
                     existing.count += cnt;
                     if (status === 403) existing.blocked403 += cnt;
+                    existing.statuses.add(status);
                     existing.zones.add(z.name);
                     pathStats.set(p, existing);
+                } else if (
+                    status >= 400 &&
+                    p !== '/' &&
+                    p !== '/robots.txt' &&
+                    p !== '/favicon.ico' &&
+                    p !== '/sitemap.xml' &&
+                    !p.startsWith('/cdn-cgi/')
+                ) {
+                    const u = uncaughtStats.get(p) || {
+                        path: p,
+                        count: 0,
+                        statuses: new Set(),
+                        zones: new Set()
+                    };
+                    u.count += cnt;
+                    u.statuses.add(status);
+                    u.zones.add(z.name);
+                    uncaughtStats.set(p, u);
                 }
+            }
+
+            if (dMat.total > 0 || dMat.trapHits > 0) {
+                domainMatrixMap.set(z.name, dMat);
             }
         } catch {
             // Ignore single-zone failure
@@ -187,8 +285,18 @@ async function fetchZoneTrapTelemetry(token, days = 7) {
             count: item.count,
             blocked403: item.blocked403,
             type: item.type,
+            statuses: [...item.statuses].sort((a, b) => a - b),
             zoneCount: item.zones.size,
             zones: [...item.zones].sort()
+        }))
+        .sort((a, b) => b.count - a.count);
+
+    const sortedUncaught = [...uncaughtStats.values()]
+        .map((item) => ({
+            path: item.path,
+            count: item.count,
+            statuses: [...item.statuses].sort((a, b) => a - b),
+            zoneCount: item.zones.size
         }))
         .sort((a, b) => b.count - a.count);
 
@@ -196,16 +304,29 @@ async function fetchZoneTrapTelemetry(token, days = 7) {
         .map(([name, count]) => ({ name, count }))
         .sort((a, b) => b.count - a.count);
 
+    const statusSummary = [...globalStatusCounts.entries()]
+        .map(([status, count]) => ({ status, count }))
+        .sort((a, b) => b.count - a.count);
+
+    const domainMatrix = [...domainMatrixMap.values()].sort((a, b) => b.total - a.total);
+
+    allTrafficList.sort((a, b) => b.count - a.count);
+
     const data = {
         configured: true,
         error: null,
         days,
         generatedAt: new Date(now).toISOString(),
+        totalRequests,
         totalTrapHits,
         total403Blocks,
         uniqueTrapPaths: sortedPaths.length,
+        statusSummary,
+        domainMatrix,
         zones: sortedZones,
-        paths: sortedPaths.slice(0, 150)
+        paths: sortedPaths.slice(0, 150),
+        allTrafficRows: allTrafficList.slice(0, 250),
+        uncaughtPaths: sortedUncaught.slice(0, 40)
     };
 
     cachedZoneStats = {
@@ -224,7 +345,7 @@ function renderDashboardHtml() {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
-  <title>Cloudflare Edge Honeypot Telemetry | Emerald Glen</title>
+  <title>Cloudflare Traffic, Honeypot & Rule Store | Emerald Glen</title>
   <style>
     :root {
       --bg: #0b0f17;
@@ -237,6 +358,7 @@ function renderDashboardHtml() {
       --emerald: #10b981;
       --amber: #f59e0b;
       --danger: #f43f5e;
+      --purple: #a78bfa;
       --mono: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
       --sans: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     }
@@ -250,7 +372,7 @@ function renderDashboardHtml() {
     }
     header {
       border-bottom: 1px solid var(--border);
-      background: rgba(19, 27, 41, 0.9);
+      background: rgba(19, 27, 41, 0.92);
       backdrop-filter: blur(10px);
       position: sticky;
       top: 0;
@@ -258,7 +380,7 @@ function renderDashboardHtml() {
       padding: 1rem 1.5rem;
     }
     .header-inner {
-      max-width: 1440px;
+      max-width: 1520px;
       margin: 0 auto;
       display: flex;
       flex-wrap: wrap;
@@ -304,7 +426,7 @@ function renderDashboardHtml() {
       gap: 0.6rem;
       flex-wrap: wrap;
     }
-    button, select, input {
+    button, select, input, textarea {
       background: var(--panel-alt);
       color: var(--text);
       border: 1px solid var(--border);
@@ -312,6 +434,14 @@ function renderDashboardHtml() {
       padding: 0.45rem 0.8rem;
       font-size: 0.85rem;
       font-family: inherit;
+    }
+    textarea {
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      width: 100%;
+      min-height: 145px;
+      resize: vertical;
+      line-height: 1.45;
     }
     button {
       cursor: pointer;
@@ -327,6 +457,11 @@ function renderDashboardHtml() {
       border-color: rgba(56, 189, 248, 0.45);
       color: var(--accent);
     }
+    button.emerald {
+      background: rgba(16, 185, 129, 0.16);
+      border-color: rgba(16, 185, 129, 0.45);
+      color: var(--emerald);
+    }
     button.danger {
       background: rgba(244, 63, 94, 0.14);
       border-color: rgba(244, 63, 94, 0.4);
@@ -334,8 +469,12 @@ function renderDashboardHtml() {
       padding: 0.25rem 0.55rem;
       font-size: 0.75rem;
     }
+    button.tiny {
+      padding: 0.18rem 0.45rem;
+      font-size: 0.72rem;
+    }
     main {
-      max-width: 1440px;
+      max-width: 1520px;
       margin: 1.5rem auto;
       padding: 0 1.5rem 3rem;
       display: grid;
@@ -343,7 +482,7 @@ function renderDashboardHtml() {
     }
     .kpis {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
       gap: 1rem;
     }
     .kpi {
@@ -354,25 +493,31 @@ function renderDashboardHtml() {
     }
     .kpi-label {
       color: var(--muted);
-      font-size: 0.78rem;
+      font-size: 0.76rem;
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }
     .kpi-val {
-      font-size: 1.9rem;
+      font-size: 1.8rem;
       font-weight: 700;
       font-family: var(--mono);
       margin-top: 0.25rem;
     }
     .kpi-sub {
       color: var(--muted);
-      font-size: 0.78rem;
+      font-size: 0.76rem;
       margin-top: 0.25rem;
     }
     .grid-2 {
       display: grid;
       grid-template-columns: 1.15fr 1fr;
       gap: 1.5rem;
+    }
+    .grid-4 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+      gap: 1rem;
+      padding: 1.1rem 1.25rem;
     }
     @media (max-width: 1024px) {
       .grid-2 { grid-template-columns: 1fr; }
@@ -399,16 +544,16 @@ function renderDashboardHtml() {
     }
     .table-wrap {
       overflow-x: auto;
-      max-height: 540px;
+      max-height: 480px;
       overflow-y: auto;
     }
     table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 0.84rem;
+      font-size: 0.83rem;
     }
     th, td {
-      padding: 0.55rem 0.9rem;
+      padding: 0.52rem 0.85rem;
       text-align: left;
       border-bottom: 1px solid rgba(37, 51, 77, 0.6);
     }
@@ -416,7 +561,7 @@ function renderDashboardHtml() {
       background: var(--panel-alt);
       color: var(--muted);
       font-weight: 600;
-      font-size: 0.75rem;
+      font-size: 0.74rem;
       text-transform: uppercase;
       letter-spacing: 0.04em;
       position: sticky;
@@ -428,7 +573,7 @@ function renderDashboardHtml() {
     }
     .mono {
       font-family: var(--mono);
-      font-size: 0.8rem;
+      font-size: 0.79rem;
       word-break: break-all;
     }
     .num {
@@ -444,35 +589,48 @@ function renderDashboardHtml() {
       font-size: 0.72rem;
       font-weight: 600;
     }
-    .pill-strong {
+    .pill-strong, .pill-403, .pill-5xx {
       background: rgba(244, 63, 94, 0.16);
       color: #fda4af;
       border: 1px solid rgba(244, 63, 94, 0.35);
     }
-    .pill-weak {
+    .pill-weak, .pill-404 {
       background: rgba(245, 158, 11, 0.16);
       color: #fcd34d;
       border: 1px solid rgba(245, 158, 11, 0.35);
     }
-    .bar-row {
-      display: grid;
-      grid-template-columns: 210px 1fr 75px;
+    .pill-clean, .pill-2xx {
+      background: rgba(16, 185, 129, 0.16);
+      color: #6ee7b7;
+      border: 1px solid rgba(16, 185, 129, 0.35);
+    }
+    .pill-3xx {
+      background: rgba(56, 189, 248, 0.16);
+      color: #7dd3fc;
+      border: 1px solid rgba(56, 189, 248, 0.35);
+    }
+    .status-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+      padding: 0.9rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: rgba(24, 34, 52, 0.45);
+    }
+    .status-badge {
+      display: flex;
       align-items: center;
-      gap: 0.75rem;
-      padding: 0.45rem 1.25rem;
-      border-bottom: 1px solid rgba(37, 51, 77, 0.45);
-      font-size: 0.83rem;
-    }
-    .bar-track {
-      height: 8px;
+      gap: 0.5rem;
       background: var(--panel-alt);
-      border-radius: 999px;
-      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.35rem 0.7rem;
+      font-family: var(--mono);
+      font-size: 0.79rem;
+      cursor: pointer;
     }
-    .bar-fill {
-      height: 100%;
-      background: linear-gradient(90deg, var(--accent), var(--emerald));
-      border-radius: 999px;
+    .status-badge:hover {
+      border-color: var(--accent);
     }
     .tester-box {
       padding: 1rem 1.25rem;
@@ -483,6 +641,42 @@ function renderDashboardHtml() {
       border-top: 1px solid var(--border);
       background: rgba(24, 34, 52, 0.5);
     }
+    .rule-col label {
+      display: block;
+      font-size: 0.8rem;
+      font-weight: 700;
+      margin-bottom: 0.25rem;
+    }
+    .rule-col .hint {
+      font-size: 0.74rem;
+      color: var(--muted);
+      margin-bottom: 0.5rem;
+    }
+    .builtin-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      padding: 0.9rem 1.25rem;
+      max-height: 220px;
+      overflow-y: auto;
+      border-top: 1px solid var(--border);
+      background: rgba(11, 15, 23, 0.45);
+    }
+    .chip {
+      font-family: var(--mono);
+      font-size: 0.73rem;
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      cursor: pointer;
+      user-select: none;
+    }
+    .chip.disabled {
+      opacity: 0.45;
+      text-decoration: line-through;
+      border-color: var(--danger);
+    }
   </style>
 </head>
 <body>
@@ -490,7 +684,7 @@ function renderDashboardHtml() {
     <div class="header-inner">
       <div class="brand">
         <span class="badge-live">Edge KV Mesh Active</span>
-        <h1>Cloudflare Edge Honeypot Telemetry</h1>
+        <h1>Cloudflare Traffic, Honeypot & Rule Store</h1>
       </div>
       <div class="controls">
         <label for="days-select" style="color:var(--muted);font-size:0.82rem;">Window:</label>
@@ -499,7 +693,15 @@ function renderDashboardHtml() {
           <option value="7" selected>Last 7 Days</option>
           <option value="14">Last 14 Days</option>
         </select>
-        <input type="search" id="path-filter" placeholder="Filter paths or IPs..." style="min-width:220px;">
+        <select id="status-filter">
+          <option value="">All Return Codes</option>
+          <option value="2xx">2xx Success (200/204)</option>
+          <option value="3xx">3xx Redirect / Not Mod (301/302/304)</option>
+          <option value="403">403 Forbidden / Blocked</option>
+          <option value="404">404 Not Found</option>
+          <option value="5xx">5xx Origin / SSL Errors</option>
+        </select>
+        <input type="search" id="path-filter" placeholder="Filter domain, path, IP..." style="min-width:220px;">
         <button class="primary" id="refresh-btn">Refresh Live Data</button>
       </div>
     </div>
@@ -508,24 +710,143 @@ function renderDashboardHtml() {
   <main>
     <section class="kpis">
       <div class="kpi">
+        <div class="kpi-label">Total Edge Requests (<span id="kpi-days-label-0">7d</span>)</div>
+        <div class="kpi-val" id="kpi-total-reqs">--</div>
+        <div class="kpi-sub">All traffic across all 19 Cloudflare zones</div>
+      </div>
+      <div class="kpi">
         <div class="kpi-label">Active 24h KV Bans</div>
-        <div class="kpi-val" id="kpi-active-bans">--</div>
+        <div class="kpi-val" id="kpi-active-bans" style="color:#fda4af;">--</div>
         <div class="kpi-sub">Shared across all connected domains</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">Total Trap Hits (<span id="kpi-days-label">7d</span>)</div>
-        <div class="kpi-val" id="kpi-trap-hits">--</div>
+        <div class="kpi-val" id="kpi-trap-hits" style="color:#fcd34d;">--</div>
         <div class="kpi-sub">Requests matching honeypot signatures</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">Total 403 Edge Blocks (<span id="kpi-days-label-2">7d</span>)</div>
-        <div class="kpi-val" id="kpi-403-blocks">--</div>
+        <div class="kpi-val" id="kpi-403-blocks" style="color:#fda4af;">--</div>
         <div class="kpi-sub">Includes repeat hits from banned IPs</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">Unique Attack Paths Seen</div>
         <div class="kpi-val" id="kpi-unique-paths">--</div>
         <div class="kpi-sub" id="kpi-rules-count">-- configured rules</div>
+      </div>
+    </section>
+
+    <!-- All-Traffic & Return Code Summary Across All Domains -->
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">All-Traffic & HTTP Return Code Summary (All 19 Cloudflare Zones)</h2>
+          <div style="font-size:0.78rem;color:var(--muted);margin-top:0.1rem;">
+            Click any HTTP status badge below to filter the request tables by return code, or click a domain row to filter by domain.
+          </div>
+        </div>
+        <span id="telemetry-updated" style="color:var(--muted);font-size:0.78rem;"></span>
+      </div>
+      <div class="status-strip" id="status-strip">
+        <span style="color:var(--muted);font-size:0.82rem;">Loading HTTP status code distribution...</span>
+      </div>
+      <div class="grid-2" style="gap:0;">
+        <div style="border-right:1px solid var(--border);">
+          <div class="card-header" style="background:rgba(24,34,52,0.3);">
+            <h3 class="card-title" style="font-size:0.88rem;">Per-Domain Traffic & Return Code Breakdown</h3>
+          </div>
+          <div class="table-wrap" style="max-height:390px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Domain Zone</th>
+                  <th style="text-align:right;">Total</th>
+                  <th style="text-align:right;color:#6ee7b7;">2xx OK</th>
+                  <th style="text-align:right;color:#7dd3fc;">3xx</th>
+                  <th style="text-align:right;color:#fda4af;">403 Block</th>
+                  <th style="text-align:right;color:#fcd34d;">404</th>
+                  <th style="text-align:right;color:#fda4af;">5xx</th>
+                  <th style="text-align:right;">Trap Hits</th>
+                </tr>
+              </thead>
+              <tbody id="domain-matrix-tbody">
+                <tr><td colspan="8" style="color:var(--muted);">Loading domain matrix...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <div class="card-header" style="background:rgba(24,34,52,0.3);">
+            <h3 class="card-title" style="font-size:0.88rem;">Top All-Traffic Requests by Return Code & Classification</h3>
+          </div>
+          <div class="table-wrap" style="max-height:390px;">
+            <table>
+              <thead>
+                <tr>
+                  <th style="text-align:right;">Hits</th>
+                  <th>Status</th>
+                  <th>Method</th>
+                  <th>Host + Path</th>
+                  <th>Class</th>
+                  <th style="text-align:right;">Override</th>
+                </tr>
+              </thead>
+              <tbody id="all-traffic-tbody">
+                <tr><td colspan="6" style="color:var(--muted);">Loading all traffic rows...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- KV Rule Store Editor -->
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">KV Honeypot Rule Editor (<code>config:rules</code> in <code>SECURITY_BANS</code>)</h2>
+          <div style="font-size:0.78rem;color:var(--muted);margin-top:0.15rem;">
+            Override or extend built-in honeypot rules in KV without redeploying code. Enter one path segment per line (e.g. <code>/my-trap</code>).
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:0.65rem;">
+          <span id="rules-save-status" style="font-size:0.8rem;color:var(--muted);"></span>
+          <button class="emerald" id="save-rules-btn">Save Rules to KV Store</button>
+        </div>
+      </div>
+      <div class="grid-4">
+        <div class="rule-col">
+          <label style="color:#fda4af;">Custom Strong Trap Segments (403 + 24h Ban)</label>
+          <div class="hint">Any request matching these segments bans the client IP for 24h across all domains.</div>
+          <textarea id="rules-strong" placeholder="/custom-exploit&#10;/secret-admin.php"></textarea>
+        </div>
+        <div class="rule-col">
+          <label style="color:#fcd34d;">Custom Weak Segments (403 Refuse Only, No Ban)</label>
+          <div class="hint">Refuses the request with 403 Forbidden without adding the IP to the 24h ban table.</div>
+          <textarea id="rules-weak" placeholder="/legacy-debug&#10;/old-api"></textarea>
+        </div>
+        <div class="rule-col">
+          <label style="color:#6ee7b7;">Custom Safe / Allowlisted Paths (Never Block/Ban)</label>
+          <div class="hint">Exempts matching paths even if they would otherwise trigger a built-in rule.</div>
+          <textarea id="rules-allow" placeholder="/wp-json/custom-webhook&#10;/metrics-public"></textarea>
+        </div>
+        <div class="rule-col">
+          <label style="color:var(--muted);">Disabled Built-in Segments (Click chip below or type)</label>
+          <div class="hint">Built-in segments listed here are bypassed during path classification.</div>
+          <textarea id="rules-disabled" placeholder="/metrics"></textarea>
+        </div>
+      </div>
+      <details>
+        <summary style="padding:0.65rem 1.25rem;cursor:pointer;font-size:0.82rem;color:var(--accent);border-top:1px solid var(--border);background:var(--panel-alt);">
+          View / Toggle All Built-in Strong & Weak Segments (Click any chip to toggle Disabled state)
+        </summary>
+        <div class="builtin-chips" id="builtin-chips-container"></div>
+      </details>
+      <div class="tester-box">
+        <span style="font-size:0.8rem;color:var(--muted);font-weight:600;">Live Classifier Test (Includes KV Overrides):</span>
+        <input type="text" id="test-path-input" placeholder="/.cursor/mcp.json" style="flex:1;min-width:220px;">
+        <button id="test-path-btn">Test Path</button>
+        <span id="test-path-result" class="mono"></span>
       </div>
     </section>
 
@@ -565,10 +886,11 @@ function renderDashboardHtml() {
               <tr>
                 <th style="text-align:right;">Banned IPs</th>
                 <th>Trigger Path</th>
+                <th style="text-align:right;">Quick Override</th>
               </tr>
             </thead>
             <tbody id="active-paths-tbody">
-              <tr><td colspan="2" style="color:var(--muted);">Loading...</td></tr>
+              <tr><td colspan="3" style="color:var(--muted);">Loading...</td></tr>
             </tbody>
           </table>
         </div>
@@ -579,7 +901,6 @@ function renderDashboardHtml() {
       <div class="card">
         <div class="card-header">
           <h2 class="card-title">Most-Seen Honeypot Trap Paths (All Cloudflare Zones)</h2>
-          <span id="telemetry-updated" style="color:var(--muted);font-size:0.78rem;"></span>
         </div>
         <div class="table-wrap">
           <table>
@@ -587,13 +908,15 @@ function renderDashboardHtml() {
               <tr>
                 <th style="text-align:right;">Total Hits</th>
                 <th style="text-align:right;">403 Blocks</th>
+                <th>Return Codes</th>
                 <th>Signal</th>
                 <th style="text-align:right;">Zones</th>
                 <th>Trap Path</th>
+                <th style="text-align:right;">Rule Override</th>
               </tr>
             </thead>
             <tbody id="top-paths-tbody">
-              <tr><td colspan="5" style="color:var(--muted);">Loading Cloudflare GraphQL telemetry...</td></tr>
+              <tr><td colspan="7" style="color:var(--muted);">Loading Cloudflare GraphQL telemetry...</td></tr>
             </tbody>
           </table>
         </div>
@@ -601,16 +924,23 @@ function renderDashboardHtml() {
 
       <div class="card">
         <div class="card-header">
-          <h2 class="card-title">Honeypot Trap Hits by Domain Zone</h2>
+          <h2 class="card-title">Uncaught 4xx/5xx Probe Candidates (Promote in 1 Click)</h2>
         </div>
-        <div id="zones-bars" style="padding: 0.6rem 0; max-height: 460px; overflow-y: auto;">
-          <div style="padding:1rem 1.25rem;color:var(--muted);">Loading zone breakdown...</div>
-        </div>
-        <div class="tester-box">
-          <span style="font-size:0.8rem;color:var(--muted);font-weight:600;">Path Classifier Test:</span>
-          <input type="text" id="test-path-input" placeholder="/.cursor/mcp.json" style="flex:1;min-width:180px;">
-          <button id="test-path-btn">Test Path</button>
-          <span id="test-path-result" class="mono"></span>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th style="text-align:right;">Hits</th>
+                <th>Codes</th>
+                <th style="text-align:right;">Zones</th>
+                <th>Path</th>
+                <th style="text-align:right;">Add to KV Store</th>
+              </tr>
+            </thead>
+            <tbody id="uncaught-paths-tbody">
+              <tr><td colspan="5" style="color:var(--muted);">Loading uncaught 4xx/5xx paths...</td></tr>
+            </tbody>
+          </table>
         </div>
       </div>
     </section>
@@ -635,27 +965,161 @@ function renderDashboardHtml() {
         .replace(/"/g, '&quot;');
     }
 
+    function statusPillClass(code) {
+      const n = Number(code);
+      if (n >= 200 && n < 300) return 'pill-2xx';
+      if (n >= 300 && n < 400) return 'pill-3xx';
+      if (n === 403) return 'pill-403';
+      if (n === 404) return 'pill-404';
+      return 'pill-5xx';
+    }
+
+    function matchesStatusFilter(code, filterVal) {
+      if (!filterVal) return true;
+      const n = Number(code);
+      if (filterVal === '2xx') return n >= 200 && n < 300;
+      if (filterVal === '3xx') return n >= 300 && n < 400;
+      if (filterVal === '403') return n === 403;
+      if (filterVal === '404') return n === 404;
+      if (filterVal === '5xx') return n >= 500;
+      return String(n) === filterVal;
+    }
+
+    function getLines(id) {
+      return document
+        .getElementById(id)
+        .value.split(/\\r?\\n/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+
+    function setLines(id, arr) {
+      document.getElementById(id).value = (arr || []).join('\\n');
+    }
+
+    function addLineToTextarea(id, pathValue) {
+      const lines = new Set(getLines(id));
+      lines.add(pathValue);
+      setLines(id, [...lines]);
+    }
+
+    function renderBuiltinChips() {
+      if (!currentData || !currentData.builtinRules) return;
+      const disabledSet = new Set(getLines('rules-disabled').map((s) => s.toLowerCase()));
+      const allBuiltin = [
+        ...currentData.builtinRules.strongSegments.map((s) => ({ s, type: 'strong' })),
+        ...currentData.builtinRules.weakSegments.map((s) => ({ s, type: 'weak' }))
+      ];
+      const container = document.getElementById('builtin-chips-container');
+      container.innerHTML = allBuiltin
+        .map(({ s, type }) => {
+          const isDis = disabledSet.has(s.toLowerCase());
+          return \`<span class="chip \${isDis ? 'disabled' : ''}" data-chip="\${escapeHtml(s)}" title="Built-in \${type} segment. Click to \${isDis ? 're-enable' : 'disable'}">\${escapeHtml(s)}</span>\`;
+        })
+        .join('');
+    }
+
     function renderAll() {
       if (!currentData) return;
       const filter = (document.getElementById('path-filter').value || '').trim().toLowerCase();
+      const statusFilter = document.getElementById('status-filter').value || '';
       const now = Date.now();
 
-      document.getElementById('kpi-active-bans').textContent = currentData.activeBans.length.toLocaleString();
-      document.getElementById('kpi-rules-count').textContent =
-        currentData.rulesCount.strongSegments + ' strong segments + dotfile/ext regexes';
+      const customCount =
+        (currentData.customRules?.strongSegments?.length || 0) +
+        (currentData.customRules?.weakSegments?.length || 0) +
+        (currentData.customRules?.allowPaths?.length || 0);
 
       const tel = currentData.telemetry;
+      document.getElementById('kpi-days-label-0').textContent = tel.days + 'd';
       document.getElementById('kpi-days-label').textContent = tel.days + 'd';
       document.getElementById('kpi-days-label-2').textContent = tel.days + 'd';
+      document.getElementById('kpi-total-reqs').textContent = (tel.totalRequests || 0).toLocaleString();
+      document.getElementById('kpi-active-bans').textContent = currentData.activeBans.length.toLocaleString();
       document.getElementById('kpi-trap-hits').textContent = (tel.totalTrapHits || 0).toLocaleString();
       document.getElementById('kpi-403-blocks').textContent = (tel.total403Blocks || 0).toLocaleString();
       document.getElementById('kpi-unique-paths').textContent = (tel.uniqueTrapPaths || 0).toLocaleString();
+      document.getElementById('kpi-rules-count').textContent =
+        currentData.rulesCount.strongSegments + ' built-in + ' + customCount + ' KV custom overrides';
 
       if (tel.error) {
         document.getElementById('telemetry-updated').textContent = tel.error;
       } else if (tel.generatedAt) {
         document.getElementById('telemetry-updated').textContent =
           'Updated ' + new Date(tel.generatedAt).toLocaleTimeString();
+      }
+
+      // Status strip
+      const totalReqs = Math.max(1, tel.totalRequests || 1);
+      const statusStrip = document.getElementById('status-strip');
+      statusStrip.innerHTML = (tel.statusSummary || [])
+        .map((s) => {
+          const pct = ((s.count / totalReqs) * 100).toFixed(1);
+          return \`<div class="status-badge" data-status-code="\${s.status}" title="Click to filter by HTTP \${s.status}">
+            <span class="pill \${statusPillClass(s.status)}">HTTP \${s.status}</span>
+            <strong>\${s.count.toLocaleString()}</strong>
+            <span style="color:var(--muted);">(\${pct}%)</span>
+          </div>\`;
+        })
+        .join('');
+
+      // Domain matrix
+      const domainRows = (tel.domainMatrix || []).filter(
+        (d) => !filter || d.zone.toLowerCase().includes(filter)
+      );
+      const dmTbody = document.getElementById('domain-matrix-tbody');
+      dmTbody.innerHTML = domainRows
+        .map(
+          (d) => \`<tr style="cursor:pointer;" data-filter-domain="\${escapeHtml(d.zone)}" title="Click to filter by \${escapeHtml(d.zone)}">
+            <td class="mono" style="font-weight:600;">\${escapeHtml(d.zone)}</td>
+            <td class="num" style="font-weight:700;">\${d.total.toLocaleString()}</td>
+            <td class="num" style="color:#6ee7b7;">\${d.s2xx.toLocaleString()}</td>
+            <td class="num" style="color:#7dd3fc;">\${d.s3xx.toLocaleString()}</td>
+            <td class="num" style="color:#fda4af;font-weight:600;">\${d.s403.toLocaleString()}</td>
+            <td class="num" style="color:#fcd34d;">\${d.s404.toLocaleString()}</td>
+            <td class="num" style="color:\${d.s5xx > 0 ? '#fda4af' : 'var(--muted)'};">\${d.s5xx.toLocaleString()}</td>
+            <td class="num" style="font-weight:600;">\${d.trapHits.toLocaleString()}</td>
+          </tr>\`
+        )
+        .join('');
+
+      // All-traffic rows
+      const trafficRows = (tel.allTrafficRows || []).filter((r) => {
+        if (!matchesStatusFilter(r.status, statusFilter)) return false;
+        if (!filter) return true;
+        return (
+          r.host.toLowerCase().includes(filter) ||
+          r.zone.toLowerCase().includes(filter) ||
+          r.path.toLowerCase().includes(filter) ||
+          String(r.status).includes(filter)
+        );
+      });
+      const allTrafficTbody = document.getElementById('all-traffic-tbody');
+      if (trafficRows.length === 0) {
+        allTrafficTbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted);">No matching traffic rows.</td></tr>';
+      } else {
+        allTrafficTbody.innerHTML = trafficRows
+          .slice(0, 150)
+          .map((r) => {
+            const clsPill =
+              r.classification === 'strong'
+                ? '<span class="pill pill-strong">strong</span>'
+                : r.classification === 'weak'
+                ? '<span class="pill pill-weak">weak</span>'
+                : '<span class="pill pill-clean">clean</span>';
+            return \`<tr>
+              <td class="num" style="font-weight:700;">\${r.count.toLocaleString()}x</td>
+              <td><span class="pill \${statusPillClass(r.status)}">\${r.status}</span></td>
+              <td class="mono">\${escapeHtml(r.method)}</td>
+              <td class="mono"><span style="color:var(--muted);">\${escapeHtml(r.host)}</span>\${escapeHtml(r.path)}</td>
+              <td>\${clsPill}</td>
+              <td style="text-align:right;white-space:nowrap;">
+                \${r.classification !== 'strong' ? \`<button class="tiny danger" data-promote-strong="\${escapeHtml(r.path)}">+Strong</button>\` : ''}
+                \${r.classification !== 'clean' ? \`<button class="tiny" data-promote-allow="\${escapeHtml(r.path)}">Allow</button>\` : ''}
+              </td>
+            </tr>\`;
+          })
+          .join('');
       }
 
       // 1. Active bans table
@@ -692,6 +1156,9 @@ function renderDashboardHtml() {
           ([p, cnt]) => \`<tr>
             <td class="num" style="font-weight:700;">\${cnt}</td>
             <td class="mono">\${escapeHtml(p)}</td>
+            <td style="text-align:right;">
+              <button class="tiny" data-promote-allow="\${escapeHtml(p)}">Allow Path</button>
+            </td>
           </tr>\`
         )
         .join('');
@@ -702,65 +1169,163 @@ function renderDashboardHtml() {
       );
       const topPathsTbody = document.getElementById('top-paths-tbody');
       if (filteredPaths.length === 0) {
-        topPathsTbody.innerHTML = '<tr><td colspan="5" style="color:var(--muted);">No matching paths.</td></tr>';
+        topPathsTbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);">No matching paths.</td></tr>';
       } else {
         topPathsTbody.innerHTML = filteredPaths
           .map(
             (p) => \`<tr>
               <td class="num" style="font-weight:700;">\${p.count.toLocaleString()}x</td>
               <td class="num">\${p.blocked403.toLocaleString()}x</td>
+              <td class="mono">\${(p.statuses || []).join(', ')}</td>
               <td><span class="pill \${p.type === 'strong' ? 'pill-strong' : 'pill-weak'}">\${escapeHtml(p.type)}</span></td>
               <td class="num" title="\${escapeHtml((p.zones || []).join(', '))}">\${p.zoneCount}</td>
               <td class="mono">\${escapeHtml(p.path)}</td>
+              <td style="text-align:right;white-space:nowrap;">
+                \${p.type === 'weak' ? \`<button class="tiny danger" data-promote-strong="\${escapeHtml(p.path)}">+Strong</button>\` : ''}
+                <button class="tiny" data-promote-allow="\${escapeHtml(p.path)}">Allow</button>
+              </td>
             </tr>\`
           )
           .join('');
       }
 
-      // 4. Zone bars
-      const zones = tel.zones || [];
-      const maxZone = zones.reduce((m, z) => Math.max(m, z.count), 1);
-      const zonesBars = document.getElementById('zones-bars');
-      zonesBars.innerHTML = zones
-        .map((z) => {
-          const pct = Math.max(2, Math.round((z.count / maxZone) * 100));
-          return \`<div class="bar-row">
-            <div class="mono" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">\${escapeHtml(z.name)}</div>
-            <div class="bar-track"><div class="bar-fill" style="width:\${pct}%"></div></div>
-            <div class="num">\${z.count.toLocaleString()}x</div>
-          </div>\`;
-        })
-        .join('');
+      // 4. Uncaught 4xx/5xx candidates
+      const filteredUncaught = (tel.uncaughtPaths || []).filter(
+        (p) => !filter || p.path.toLowerCase().includes(filter)
+      );
+      const uncaughtTbody = document.getElementById('uncaught-paths-tbody');
+      if (filteredUncaught.length === 0) {
+        uncaughtTbody.innerHTML = '<tr><td colspan="5" style="color:var(--muted);">No uncaught 4xx/5xx probe candidates.</td></tr>';
+      } else {
+        uncaughtTbody.innerHTML = filteredUncaught
+          .map(
+            (p) => \`<tr>
+              <td class="num" style="font-weight:700;">\${p.count.toLocaleString()}x</td>
+              <td class="mono">\${(p.statuses || []).join(', ')}</td>
+              <td class="num">\${p.zoneCount}</td>
+              <td class="mono">\${escapeHtml(p.path)}</td>
+              <td style="text-align:right;white-space:nowrap;">
+                <button class="tiny danger" data-promote-strong="\${escapeHtml(p.path)}">+Strong</button>
+                <button class="tiny" data-promote-weak="\${escapeHtml(p.path)}">+Weak</button>
+              </td>
+            </tr>\`
+          )
+          .join('');
+      }
     }
 
-    async function loadStats() {
+    async function saveRulesNow() {
+      const btn = document.getElementById('save-rules-btn');
+      const statusEl = document.getElementById('rules-save-status');
+      btn.textContent = 'Saving...';
+      const payload = {
+        strongSegments: getLines('rules-strong'),
+        weakSegments: getLines('rules-weak'),
+        allowPaths: getLines('rules-allow'),
+        disabledSegments: getLines('rules-disabled')
+      };
+      const res = await fetch('/api/rules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const saved = await res.json();
+      btn.textContent = 'Save Rules to KV Store';
+      statusEl.textContent = 'Saved to KV at ' + new Date(saved.rules.updatedAt).toLocaleTimeString();
+      statusEl.style.color = '#10b981';
+      await loadStats(false);
+    }
+
+    async function loadStats(populateEditor = true) {
       const days = document.getElementById('days-select').value || '7';
       const btn = document.getElementById('refresh-btn');
       btn.textContent = 'Loading...';
       try {
         const res = await fetch('/api/stats?days=' + encodeURIComponent(days));
         currentData = await res.json();
+        if (populateEditor && currentData.customRules) {
+          setLines('rules-strong', currentData.customRules.strongSegments);
+          setLines('rules-weak', currentData.customRules.weakSegments);
+          setLines('rules-allow', currentData.customRules.allowPaths);
+          setLines('rules-disabled', currentData.customRules.disabledSegments);
+          if (currentData.customRules.updatedAt) {
+            document.getElementById('rules-save-status').textContent =
+              'Last saved: ' + new Date(currentData.customRules.updatedAt).toLocaleString();
+          }
+        }
+        renderBuiltinChips();
         renderAll();
       } finally {
         btn.textContent = 'Refresh Live Data';
       }
     }
 
-    document.getElementById('refresh-btn').addEventListener('click', loadStats);
-    document.getElementById('days-select').addEventListener('change', loadStats);
+    document.getElementById('refresh-btn').addEventListener('click', () => loadStats(true));
+    document.getElementById('days-select').addEventListener('change', () => loadStats(false));
+    document.getElementById('status-filter').addEventListener('change', renderAll);
     document.getElementById('path-filter').addEventListener('input', renderAll);
+    document.getElementById('save-rules-btn').addEventListener('click', saveRulesNow);
 
-    document.getElementById('active-bans-tbody').addEventListener('click', async (e) => {
-      const btn = e.target.closest('[data-unban]');
-      if (!btn) return;
-      const ip = btn.getAttribute('data-unban');
-      btn.textContent = '...';
-      await fetch('/api/unban', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ip })
-      });
-      await loadStats();
+    document.getElementById('builtin-chips-container').addEventListener('click', (e) => {
+      const chip = e.target.closest('[data-chip]');
+      if (!chip) return;
+      const seg = chip.getAttribute('data-chip');
+      const current = new Set(getLines('rules-disabled'));
+      if (current.has(seg)) {
+        current.delete(seg);
+      } else {
+        current.add(seg);
+      }
+      setLines('rules-disabled', [...current]);
+      renderBuiltinChips();
+    });
+
+    document.body.addEventListener('click', async (e) => {
+      const statusBadge = e.target.closest('[data-status-code]');
+      if (statusBadge) {
+        const code = statusBadge.getAttribute('data-status-code');
+        const filterInput = document.getElementById('path-filter');
+        filterInput.value = filterInput.value === code ? '' : code;
+        renderAll();
+        return;
+      }
+      const domainRow = e.target.closest('[data-filter-domain]');
+      if (domainRow) {
+        const dom = domainRow.getAttribute('data-filter-domain');
+        const filterInput = document.getElementById('path-filter');
+        filterInput.value = filterInput.value === dom ? '' : dom;
+        renderAll();
+        return;
+      }
+      const strongBtn = e.target.closest('[data-promote-strong]');
+      if (strongBtn) {
+        addLineToTextarea('rules-strong', strongBtn.getAttribute('data-promote-strong'));
+        await saveRulesNow();
+        return;
+      }
+      const weakBtn = e.target.closest('[data-promote-weak]');
+      if (weakBtn) {
+        addLineToTextarea('rules-weak', weakBtn.getAttribute('data-promote-weak'));
+        await saveRulesNow();
+        return;
+      }
+      const allowBtn = e.target.closest('[data-promote-allow]');
+      if (allowBtn) {
+        addLineToTextarea('rules-allow', allowBtn.getAttribute('data-promote-allow'));
+        await saveRulesNow();
+        return;
+      }
+      const unbanBtn = e.target.closest('[data-unban]');
+      if (unbanBtn) {
+        const ip = unbanBtn.getAttribute('data-unban');
+        unbanBtn.textContent = '...';
+        await fetch('/api/unban', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ip })
+        });
+        await loadStats(false);
+      }
     });
 
     document.getElementById('manual-ban-btn').addEventListener('click', async () => {
@@ -773,7 +1338,7 @@ function renderDashboardHtml() {
         body: JSON.stringify({ ip, path: '/manual-dashboard-ban' })
       });
       input.value = '';
-      await loadStats();
+      await loadStats(false);
     });
 
     document.getElementById('test-path-btn').addEventListener('click', async () => {
@@ -785,7 +1350,7 @@ function renderDashboardHtml() {
       out.style.color = data.classification === 'strong' ? '#fda4af' : data.classification === 'weak' ? '#fcd34d' : '#10b981';
     });
 
-    loadStats();
+    loadStats(true);
   </script>
 </body>
 </html>`;
@@ -813,16 +1378,45 @@ export default {
 
         if (path === '/api/classify') {
             const testPath = url.searchParams.get('path') || '/';
+            const customRules = await getCustomRules(env);
             return new Response(
                 JSON.stringify({
                     path: testPath,
-                    classification: classifyScannerPath(testPath)
+                    classification: classifyScannerPath(testPath, { customRules })
                 }),
                 {
                     status: 200,
                     headers: { ...securityHeaders, 'Content-Type': 'application/json; charset=utf-8' }
                 }
             );
+        }
+
+        if (path === '/api/rules') {
+            if (request.method === 'GET') {
+                const customRules = await getCustomRules(env);
+                return new Response(
+                    JSON.stringify({
+                        customRules,
+                        builtinRules: {
+                            strongSegments: SCANNER_SEGMENTS,
+                            weakSegments: WEAK_SCANNER_SEGMENTS
+                        }
+                    }),
+                    {
+                        status: 200,
+                        headers: { ...securityHeaders, 'Content-Type': 'application/json; charset=utf-8' }
+                    }
+                );
+            }
+            if (request.method === 'POST') {
+                const body = await request.json();
+                const saved = await saveCustomRules(body, env);
+                cachedZoneStats.expiresAt = 0;
+                return new Response(JSON.stringify({ ok: true, rules: saved }), {
+                    status: 200,
+                    headers: { ...securityHeaders, 'Content-Type': 'application/json; charset=utf-8' }
+                });
+            }
         }
 
         if (path === '/api/unban' && request.method === 'POST') {
@@ -863,15 +1457,21 @@ export default {
         if (path === '/api/stats') {
             const days = Math.max(1, Math.min(30, Number(url.searchParams.get('days')) || 7));
             const token = env.CF_ANALYTICS_TOKEN || '';
+            const customRules = await getCustomRules(env);
             const [activeBans, telemetry] = await Promise.all([
                 listActiveBansFromKv(env),
-                fetchZoneTrapTelemetry(token, days)
+                fetchZoneTrapTelemetry(token, days, customRules)
             ]);
 
             return new Response(
                 JSON.stringify({
                     activeBans,
                     telemetry,
+                    customRules,
+                    builtinRules: {
+                        strongSegments: SCANNER_SEGMENTS,
+                        weakSegments: WEAK_SCANNER_SEGMENTS
+                    },
                     rulesCount: {
                         strongSegments: SCANNER_SEGMENTS.length,
                         weakSegments: WEAK_SCANNER_SEGMENTS.length
