@@ -89,7 +89,7 @@ async function main() {
     console.log('================================================================================\n');
 
     // 1. Fetch active KV bans
-    const keysUrl = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE_ID}/keys?limit=1000`;
+    const keysUrl = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE_ID}/keys?prefix=ban:&limit=1000`;
     const keysResp = await cfFetch(keysUrl, token);
     const keys = keysResp.result || [];
 
@@ -102,6 +102,10 @@ async function main() {
                 key: k.name,
                 ip: parsed.ip || k.name.replace(/^ban:/, ''),
                 path: parsed.path || '(unknown)',
+                host: parsed.host || '',
+                country: parsed.country || '',
+                city: parsed.city || '',
+                asOrganization: parsed.asOrganization || '',
                 bannedAt: parsed.bannedAt || 0,
                 expiresAt: parsed.expiresAt || 0
             };
@@ -110,6 +114,10 @@ async function main() {
                 key: k.name,
                 ip: k.name.replace(/^ban:/, ''),
                 path: '(unreadable)',
+                host: '',
+                country: '',
+                city: '',
+                asOrganization: '',
                 bannedAt: 0,
                 expiresAt: 0
             };
@@ -135,10 +143,11 @@ async function main() {
             console.log(`    ${String(count).padStart(4)} banned IPs  <-  ${p}`);
         }
         console.log('\n  Most Recent 15 Banned IPs:');
-        console.log(`    ${'IP Address'.padEnd(38)} ${'TTL Left'.padEnd(10)} Trigger Path`);
+        console.log(`    ${'IP Address'.padEnd(36)} ${'Location'.padEnd(18)} ${'TTL Left'.padEnd(9)} Trigger Path`);
         for (const b of banRecords.slice(0, 15)) {
             const ttl = b.expiresAt ? formatDuration(b.expiresAt - now) : 'n/a';
-            console.log(`    ${b.ip.padEnd(38)} ${ttl.padEnd(10)} ${b.path}`);
+            const loc = [b.country, b.city].filter(Boolean).join('/') || '--';
+            console.log(`    ${b.ip.padEnd(36)} ${loc.slice(0, 17).padEnd(18)} ${ttl.padEnd(9)} ${b.path}`);
         }
     }
 
@@ -163,6 +172,7 @@ async function main() {
           ) {
             count
             dimensions {
+              clientCountryName
               clientRequestHTTPHost
               clientRequestPath
               edgeResponseStatus
@@ -174,6 +184,7 @@ async function main() {
 
     const pathStats = new Map();
     const zoneTrapTotals = new Map();
+    const countryTrapTotals = new Map();
     let totalTrapHits = 0;
     let total403Blocks = 0;
 
@@ -189,6 +200,7 @@ async function main() {
             const groups = res?.data?.viewer?.zones?.[0]?.httpRequestsAdaptiveGroups || [];
             for (const g of groups) {
                 const p = g.dimensions.clientRequestPath;
+                const country = g.dimensions.clientCountryName || 'XX';
                 const status = g.dimensions.edgeResponseStatus;
                 const cnt = g.count;
 
@@ -200,6 +212,7 @@ async function main() {
                 if (classification) {
                     totalTrapHits += cnt;
                     zoneTrapTotals.set(z.name, (zoneTrapTotals.get(z.name) || 0) + cnt);
+                    countryTrapTotals.set(country, (countryTrapTotals.get(country) || 0) + cnt);
 
                     const existing = pathStats.get(p) || {
                         count: 0,
@@ -220,6 +233,7 @@ async function main() {
 
     const sortedTrapPaths = [...pathStats.entries()].sort((a, b) => b[1].count - a[1].count);
     const sortedZones = [...zoneTrapTotals.entries()].sort((a, b) => b[1] - a[1]);
+    const sortedCountries = [...countryTrapTotals.entries()].sort((a, b) => b[1] - a[1]);
 
     console.log(
         `  Total Honeypot Trap Hits (${days}d): ${totalTrapHits.toLocaleString()} across ${sortedTrapPaths.length} unique trap paths`
@@ -229,6 +243,11 @@ async function main() {
     console.log('  Trap Hits by Domain Zone:');
     for (const [zname, cnt] of sortedZones) {
         console.log(`    ${String(cnt).padStart(6)}x  ${zname}`);
+    }
+
+    console.log('\n  Top Attacking Countries (Honeypot Trap Hits):');
+    for (const [c, cnt] of sortedCountries.slice(0, 12)) {
+        console.log(`    ${String(cnt).padStart(6)}x  ${c}`);
     }
 
     console.log(`\n  Top ${topN} Most-Seen Honeypot Paths (Last ${days} Days):`);

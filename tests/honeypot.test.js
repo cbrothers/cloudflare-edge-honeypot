@@ -8,6 +8,7 @@ import {
     clearBannedIps,
     createEdgeHoneypotMiddleware,
     deriveOverrideToken,
+    extractRequestMetadata,
     getCustomRules,
     isIpBanned,
     isScannerPath,
@@ -471,5 +472,48 @@ describe('cloudflare-edge-honeypot shared module', () => {
         assert.equal(classifyScannerPath('/custom-soft-block/sub', { customRules: loaded }), 'weak');
         assert.equal(classifyScannerPath('/wp-json/custom-public', { customRules: loaded }), null);
         assert.equal(classifyScannerPath('/metrics', { customRules: loaded }), null);
+    });
+
+    test('banIp stores country, city, asn, asOrganization, and target host metadata in KV', async () => {
+        clearBannedIps();
+        const kv = createCountingKv();
+        const env = { SECURITY_BANS: kv.binding };
+        const { onRequest } = createEdgeHoneypotMiddleware({ apexHostname: 'example.com' });
+        const attackerIp = '203.0.113.88';
+
+        const req = new Request('https://www.example.com/.env', {
+            headers: {
+                'CF-Connecting-IP': attackerIp,
+                'CF-IPCountry': 'NL',
+                'User-Agent': 'ScannerBot/2.1'
+            }
+        });
+        Object.defineProperty(req, 'cf', {
+            value: {
+                country: 'NL',
+                city: 'Amsterdam',
+                region: 'North Holland',
+                asn: 14061,
+                asOrganization: 'DigitalOcean, LLC'
+            }
+        });
+
+        const res = await onRequest({ request: req, env, next: okNext });
+        assert.equal(res.status, 403);
+
+        const storedRaw = kv.store.get(`ban:${attackerIp}`);
+        assert.ok(storedRaw);
+        const stored = JSON.parse(storedRaw);
+        assert.equal(stored.ip, attackerIp);
+        assert.equal(stored.path, '/.env');
+        assert.equal(stored.host, 'www.example.com');
+        assert.equal(stored.country, 'NL');
+        assert.equal(stored.city, 'Amsterdam');
+        assert.equal(stored.region, 'North Holland');
+        assert.equal(stored.asn, 14061);
+        assert.equal(stored.asOrganization, 'DigitalOcean, LLC');
+        assert.equal(stored.userAgent, 'ScannerBot/2.1');
+        assert.ok(stored.bannedAt > 0);
+        assert.ok(stored.expiresAt > stored.bannedAt);
     });
 });

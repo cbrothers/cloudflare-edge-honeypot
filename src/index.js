@@ -676,7 +676,37 @@ export async function isIpBanned(clientIp, env, now = Date.now()) {
     return false;
 }
 
-export async function banIp(clientIp, pathname, env, now = Date.now()) {
+export function extractRequestMetadata(request = null, url = null) {
+    const cf = request && request.cf ? request.cf : null;
+    const country =
+        (cf && typeof cf.country === 'string' && cf.country.trim()) ||
+        (request && request.headers && typeof request.headers.get === 'function'
+            ? request.headers.get('CF-IPCountry') || ''
+            : '');
+    const city = cf && typeof cf.city === 'string' ? cf.city.trim() : '';
+    const region = cf && typeof cf.region === 'string' ? cf.region.trim() : '';
+    const asn = cf && cf.asn ? Number(cf.asn) : null;
+    const asOrganization =
+        cf && typeof cf.asOrganization === 'string' ? cf.asOrganization.trim() : '';
+    const userAgent =
+        request && request.headers && typeof request.headers.get === 'function'
+            ? (request.headers.get('User-Agent') || '').slice(0, 180)
+            : '';
+    const host =
+        (url && typeof url.hostname === 'string' && url.hostname.trim().toLowerCase()) || '';
+
+    return {
+        host: host || undefined,
+        country: country || undefined,
+        city: city || undefined,
+        region: region || undefined,
+        asn: asn || undefined,
+        asOrganization: asOrganization || undefined,
+        userAgent: userAgent || undefined
+    };
+}
+
+export async function banIp(clientIp, pathname, env, now = Date.now(), meta = null) {
     if (!clientIp) return;
     const normalizedIp = clientIp.trim().toLowerCase();
     const expiresAt = now + BAN_TTL_MS;
@@ -696,9 +726,11 @@ export async function banIp(clientIp, pathname, env, now = Date.now()) {
 
     if (env && env.SECURITY_BANS && typeof env.SECURITY_BANS.put === 'function') {
         try {
+            const extra = meta && typeof meta === 'object' ? meta : {};
             const payload = JSON.stringify({
                 ip: normalizedIp,
                 path: pathname,
+                ...extra,
                 bannedAt: now,
                 expiresAt
             });
@@ -860,7 +892,7 @@ export async function evaluateHoneypotRequest({
 
     const staticProbe = classifyScannerPath(url.pathname, { allowPaths, customRules });
     if (staticProbe === 'strong') {
-        await banIp(clientIp, url.pathname, env, now);
+        await banIp(clientIp, url.pathname, env, now, extractRequestMetadata(request, url));
         return {
             blockedResponse: createForbiddenResponse('Honeypot Triggered'),
             setCookieHeader: null
@@ -885,7 +917,7 @@ export async function evaluateHoneypotRequest({
             : staticProbe;
 
     if (probe === 'strong') {
-        await banIp(clientIp, url.pathname, env, now);
+        await banIp(clientIp, url.pathname, env, now, extractRequestMetadata(request, url));
         return {
             blockedResponse: createForbiddenResponse('Honeypot Triggered'),
             setCookieHeader: null
